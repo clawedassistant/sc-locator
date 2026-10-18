@@ -730,6 +730,12 @@ HEIGHT_TOLERANCE = 1.0
 # hundreds, and the alternative is a line that changes shape twice a second.
 HEIGHT_HOLD_SECONDS = 3.0
 
+# How fast the believed planet-frame position may move between frames, and
+# how long it stays the reference for that test with no reading accepted.
+# Ships top out well under this; a misread digit is far beyond it.
+FIX_MAX_SPEED = 5000.0                   # m/s
+FIX_HOLD_SECONDS = 20.0
+
 # Frames a new body name must survive before it replaces the current one.
 PLANET_SWITCH_FRAMES = 3
 
@@ -1501,7 +1507,9 @@ class State:
         self.agl = None          # height over that terrain, m; None if unsure
         self.replaced = None     # (planet, record it replaced) until reviewed
         self.heights_bad = 0     # height reads dropped for failing the identity
-        self.held_pos = 0        # position reads held for the same reason, after a jump
+        self.held_pos = 0        # position reads held as out of reach or self-contradicting
+        self.pos_time = 0.0      # when the believed position last moved
+        self.pos_candidate = None   # (pos, agreeing frames) of a reading out of reach
         self.heights_time = 0.0  # when heights were last believed
         self.heights_conflict = False   # last frame's heights contradicted it
         self.heights_seen = None # (elev, alt, |pos| - radius, radius) when they did
@@ -2065,23 +2073,49 @@ class State:
                       and too_fast(ref[1], ref[2], pos, now))
             if fresh_elev is not None:
                 self.checked_pos = (planet, pos, now)
-            # A reading whose heights contradict it, and which has jumped
-            # from the last one the heights vouched for, is a misread digit
-            # in the CamPos row: 22 m from a waypoint one frame, 400 km the
-            # next, then 250 km (Yela, 2026-10-18). Held rather than shown.
-            # The fix is not stale -- the HUD is being read, only refused --
-            # and on a parked ship a misread that repeats frame after frame
-            # (the image does not change) stays held, which is the right
-            # answer: the ship is where the last good reading put it.
-            if self.heights_conflict and jumped and self.pos is not None:
+            # The believed position. One frame cannot move it further than
+            # the ship could have flown since the last one: a misread digit
+            # in the CamPos row moves the reading by anything from 700 m to
+            # 158,000 km, and in an asteroid field, with white rock drifting
+            # behind the HUD text, a third of the frames were like that
+            # (Yela, 2026-10-18). A reading beyond reach is held, and only
+            # three in a row that agree with each other relocate the ship,
+            # so dropping out of quantum still lands in under two seconds.
+            # A reading within reach whose own heights contradict it is held
+            # too, for a few seconds at most: the heights are two numbers
+            # read off the same frame, and when they disagree with the
+            # position the position is as likely wrong as they are.
+            held = None
+            prev = (self.pos if self.planet == planet and self.pos is not None
+                    and now - self.pos_time < FIX_HOLD_SECONDS else None)
+            if prev is not None:
+                slack = FIX_MAX_SPEED * max(now - self.pos_time, 1.0)
+                if math.dist(pos, prev) > slack:
+                    cand = self.pos_candidate
+                    if cand is not None and math.dist(pos, cand[0]) <= slack:
+                        self.pos_candidate = (pos, cand[1] + 1)
+                    else:
+                        self.pos_candidate = (pos, 1)
+                    if self.pos_candidate[1] < SYSTEM_RELOCK_FRAMES:
+                        held = (f"{math.dist(pos, prev):,.0f} m from the "
+                                f"believed position (reach {slack:,.0f} m)")
+                    else:
+                        self.log(f"position relocated {math.dist(pos, prev):,.0f}"
+                                 f" m after {self.pos_candidate[1]} agreeing frames")
+                        self.pos_candidate = None
+                elif (self.heights_conflict
+                      and now - self.pos_time < HEIGHT_HOLD_SECONDS):
+                    held = "its heights disagree with it"
+                else:
+                    self.pos_candidate = None
+            if held is not None:
                 self.held_pos += 1
-                if self.held_pos <= 3 or self.held_pos % 50 == 0:
-                    self.log(f"position held: heights disagree and it jumped "
-                             f"{math.dist(ref[1], pos):,.0f} m from the last "
-                             f"checked fix ({self.held_pos} so far)")
+                if self.held_pos <= 5 or self.held_pos % 50 == 0:
+                    self.log(f"position held: {held} ({self.held_pos} so far)")
                 self.fix_time = now
                 self.status = "ok"
                 return
+            self.pos_time = now
             lat, lon, _ = to_latlon(*pos)
             if planet != self.planet:
                 self.ref = None
