@@ -1,0 +1,42 @@
+# Builds sc-locator.exe on a Windows runner so nobody needs Python or
+# Tesseract installed locally. The .exe is attached to the run as an
+# artifact (Actions tab -> the run -> Artifacts -> sc-locator).
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tesseract (UB Mannheim build)
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+      - name: Install Python packages
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller pefile
+
+      - name: Build the .exe
+        run: pyinstaller sc_locator.spec
+
+      - name: Smoke test
+        run: dist\sc-locator.exe convert 1000000 0 0 --radius 1000000
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sc-locator
+          path: dist/sc-locator.exe
