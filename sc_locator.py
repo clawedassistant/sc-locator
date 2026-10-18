@@ -1739,63 +1739,93 @@ class State:
         if spread < FRAME_LOCK_SPREAD or pts[-1][0] - pts[0][0] < 20.0:
             return
         t_ref = pts[-1][0]
-        rows = [(t - t_ref, L[0], L[1], S[0], S[1]) for t, L, S in pts]
+        rows = [(t - t_ref, L[0], L[1], S[0], S[1]) for t, L, S in pts[-80:]]
         n = len(rows)
 
-        def cost(theta, rate):
+        def residuals(theta, rate, robust):
+            """Per-pair miss distances squared, with the centre put at the
+            median (robust) or the mean of the pairs' implied centres."""
             a0, w = math.radians(theta), math.radians(rate)
-            sx = sy = 0.0
             dx, dy = [], []
             for dt, lx, ly, px, py in rows:
                 a = a0 + w * dt
                 c, s_ = math.cos(a), math.sin(a)
-                x, y = px - (c * lx - s_ * ly), py - (s_ * lx + c * ly)
-                dx.append(x)
-                dy.append(y)
-                sx += x
-                sy += y
-            cx, cy = sx / n, sy / n
-            return sum((x - cx) ** 2 + (y - cy) ** 2
-                       for x, y in zip(dx, dy)), (cx, cy)
+                dx.append(px - (c * lx - s_ * ly))
+                dy.append(py - (s_ * lx + c * ly))
+            if robust:
+                sx, sy = sorted(dx), sorted(dy)
+                cx, cy = sx[len(sx) // 2], sy[len(sy) // 2]
+            else:
+                cx, cy = sum(dx) / len(dx), sum(dy) / len(dy)
+            return [(x - cx) ** 2 + (y - cy) ** 2
+                    for x, y in zip(dx, dy)], (cx, cy)
 
-        # Coarse grid over the phase and plausible spin rates, then refine
-        # each in turn. Rates: a body's day of two hours to two weeks.
-        rates = [k * 0.0005 for k in range(-100, 101)]
-        best = min(((cost(th, r)[0], th, r) for th in range(0, 360, 2)
+        def cost(theta, rate, robust=True):
+            """Median miss for the grid and the refinement, so that half
+            the pairs can be garbage without pulling the fit (least median
+            of squares); the mean for the final polish on the inliers."""
+            r2, centre = residuals(theta, rate, robust)
+            if robust:
+                return sorted(r2)[len(r2) // 2], centre
+            return sum(r2), centre
+
+        # Coarse grid over the phase and plausible spin rates (a body's day
+        # of half an hour to a week), refine each in turn, then throw out
+        # the pairs that do not fit and polish on the rest: a misread digit
+        # in either row lands a pair kilometres off, and in an asteroid
+        # field most pairs were like that (41 of 216 fitted, Yela,
+        # 2026-10-18). Yela turns at 0.055 deg/s in real time, one lap in
+        # 1.8 h: the game's UniverseTime runs six times faster than the
+        # clock, which is why a fit in those units came out at 10.9 h.
+        rates = [k * 0.005 for k in range(-50, 51)]
+        best = min(((cost(th, r)[0], th, r) for th in range(0, 360, 4)
                     for r in rates), key=lambda q: q[0])
         _, theta, rate = best
-        for _ in range(3):
-            lo, hi = theta - 2.0, theta + 2.0
-            for _ in range(20):
-                m1, m2 = hi - 0.618 * (hi - lo), lo + 0.618 * (hi - lo)
-                if cost(m1, rate)[0] < cost(m2, rate)[0]:
-                    hi = m2
-                else:
-                    lo = m1
-            theta = (lo + hi) / 2
-            lo, hi = rate - 0.0005, rate + 0.0005
-            for _ in range(20):
-                m1, m2 = hi - 0.618 * (hi - lo), lo + 0.618 * (hi - lo)
-                if cost(theta, m1)[0] < cost(theta, m2)[0]:
-                    hi = m2
-                else:
-                    lo = m1
-            rate = (lo + hi) / 2
-        err, (cx, cy) = cost(theta, rate)
+
+        def refine(theta, rate, dth, dr, robust=True):
+            for _ in range(3):
+                lo, hi = theta - dth, theta + dth
+                for _ in range(20):
+                    m1, m2 = hi - 0.618 * (hi - lo), lo + 0.618 * (hi - lo)
+                    if cost(m1, rate, robust)[0] < cost(m2, rate, robust)[0]:
+                        hi = m2
+                    else:
+                        lo = m1
+                theta = (lo + hi) / 2
+                lo, hi = rate - dr, rate + dr
+                for _ in range(20):
+                    m1, m2 = hi - 0.618 * (hi - lo), lo + 0.618 * (hi - lo)
+                    if cost(theta, m1, robust)[0] < cost(theta, m2, robust)[0]:
+                        hi = m2
+                    else:
+                        lo = m1
+                rate = (lo + hi) / 2
+            return theta, rate
+
+        theta, rate = refine(theta, rate, 4.0, 0.005)
+        total = n
+        r2, _ = residuals(theta, rate, True)
+        keep = [row for row, e in zip(rows, r2)
+                if e <= (FRAME_LOCK_RMS * 2) ** 2]
+        if len(keep) >= 6:
+            rows, n = keep, len(keep)
+            theta, rate = refine(theta, rate, 1.0, 0.001, robust=False)
+        err, (cx, cy) = cost(theta, rate, robust=False)
         rms = math.sqrt(err / n)
-        if rms > FRAME_LOCK_RMS:
+        if rms > FRAME_LOCK_RMS or n < 6:
             if self.frame_theta is None:
-                self.log(f"frame lock: rms {rms:,.0f} m over {n} pairs, not yet")
+                self.log(f"frame lock: rms {rms:,.0f} m over {n} of {total} "
+                         f"pairs, not yet")
             return
         changed = self.frame_theta is None
         self.frame_theta = (theta % 360.0, rate, t_ref)
         self.frame_time = now
         self.frame_centre = (cx, cy, 0.0)
-        if changed or n % 20 == 0:
+        if changed or total % 20 == 0:
             self.log(f"frame lock {planet}: theta {theta % 360:.2f} deg, "
-                     f"{rate:.5f} deg/s (day {360 / abs(rate) / 3600 if rate else 0:.1f} h), "
+                     f"{rate:.5f} deg/s (day {360 / abs(rate) / 3600 if rate else 0:.2f} h), "
                      f"centre ({cx / 1000:,.1f}, {cy / 1000:,.1f}) km, rms {rms:.0f} m "
-                     f"over {n} pairs")
+                     f"over {n} of {total} pairs")
 
     def frame_theta_at(self, now):
         """The spin phase now, or None without a lock: phase carried forward
