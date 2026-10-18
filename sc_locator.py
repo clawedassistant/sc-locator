@@ -1274,6 +1274,13 @@ SYSTEM_RELOCK_FRAMES = 3
 # A dropped minus sign mirrors the direction, which is far more than this.
 CAMDIR_AGREE_DEG = 25.0
 
+# The frame lock: how long position pairs are kept, how far the ship must
+# have moved among them, and the fit residual beyond which no lock is taken.
+FRAME_LOCK_WINDOW = 180.0
+FRAME_LOCK_SPREAD = 300.0
+FRAME_LOCK_RMS = 60.0
+FRAME_LOCK_HOLD = 1800.0   # how long a lock is carried forward at its rate
+
 # How often the believed system position is logged, with how far it has moved
 # since the last line. Purely a measurement: the planet frame rotates with its
 # body -- 0.021 deg/s on Crusader, which sweeps a motionless ship 18,583 km/s
@@ -1329,37 +1336,47 @@ _CAMDIR_RE = re.compile(r"c[a@]m\s*d[il1]r", re.I)
 _CAMDIR_NUM_RE = re.compile(r"[-+]?\d*[.,]\d+|[-+]?\d+")
 
 
-def angles_to_axes(yaw, pitch, roll):
+def angles_to_axes(pitch, roll, yaw):
     """(forward, up) unit vectors for the HUD's CamDir angles, in degrees.
 
-    The row is `yaw pitch roll`: across five readings the middle value
-    stayed within a few degrees of 0 while the other two ran anywhere, and a
-    pilot's pitch is the one that stays small while roll in space is
-    arbitrary (Yela, 2026-10-18). Yaw turns about the frame's z, pitch about
-    the camera's own x, roll about its own forward; the camera looks along
-    +y and its up is +z before any rotation, so
+    The row is the engine's camera angles, `pitch roll yaw` (CryEngine's
+    Ang3 from GetAnglesXYZ): M = Rz(yaw) Ry(roll) Rx(pitch), the camera
+    looking along +y and its up being +z before any rotation. They are
+    measured in the system (Root) frame, not the body's rotating one: in a
+    coupled straight flight near Yela the yaw crept 69 to 77 over fifteen
+    minutes, exactly Yela's spin rate, and with the spin phase taken out
+    the nose matched the direction flown to 8 degrees (2026-10-18). An
+    earlier flight that fitted nothing turned out to be decoupled.
 
       forward = (-sin yaw cos pitch, cos yaw cos pitch, sin pitch)
 
-    and up is the same rotations applied to (0, 0, 1), roll included. The
-    up vector is what makes "turn right" and "pitch up" mean what the pilot
-    sees out of the window, however the ship is rolled.
+    up is M (0, 0, 1), roll included: it is what makes "turn right" and
+    "pitch up" mean what the pilot sees, however the ship is rolled.
     """
-    y, p, r = (math.radians(a) for a in (yaw, pitch, roll))
-    sy, cy, sp, cp, sr, cr = (math.sin(y), math.cos(y), math.sin(p),
-                              math.cos(p), math.sin(r), math.cos(r))
-    forward = (-sy * cp, cy * cp, sp)
-    up = (sr * cy + sp * cr * sy,
-          sr * sy - sp * cr * cy,
+    p, r, y = (math.radians(a) for a in (pitch, roll, yaw))
+    sp, cp, sr, cr, sy, cy = (math.sin(p), math.cos(p), math.sin(r),
+                              math.cos(r), math.sin(y), math.cos(y))
+    forward = (sr * sp * cy - cp * sy,
+               sr * sp * sy + cp * cy,
+               cr * sp)
+    up = (cp * sr * cy + sp * sy,
+          cp * sr * sy - sp * cy,
           cp * cr)
     return forward, up
+
+
+def rotate_z(v, deg):
+    """v turned `deg` degrees about z."""
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    return (c * v[0] - s * v[1], s * v[0] + c * v[1], v[2])
 
 
 def parse_cam_dir(text):
     """Where the camera points, as (forward, up) unit vectors, or None.
 
-    Read from the CamDir row: `CamDir: 4 2 -121 FOV: 60 ...` (Yela,
-    2026-10-18), three whole-degree angles, yaw pitch roll, turned into
+    Read from the CamDir row: `CamDir: 12 -1 72 FOV: 60 ...` (Yela,
+    2026-10-18), three whole-degree angles, pitch roll yaw, turned into
     axes by angles_to_axes. Whole degrees is all the HUD prints, so the nose
     is known to half a degree, which is plenty. Angles beyond 360 are a
     misread digit and dropped; a lost minus sign is sadly not detectable
@@ -1537,6 +1554,11 @@ class State:
         self.cam_up = None       # and which way is up on its screen
         self.cam_dir_time = 0.0
         self.cam_dir_seen = None    # the last reading, believed or not
+        self.frame_pairs = []    # (time, planet pos, system pos) read together
+        self.frame_theta = None  # spin phase: system = centre + Rz(theta) planet
+        self.frame_centre = None
+        self.frame_time = 0.0
+        self.frame_fit_time = 0.0
         self.camdir_log_time = 0.0
         self.cam_dir_logged = False
         self.nose_check_time = 0.0
@@ -1693,6 +1715,95 @@ class State:
         self.space_speed = sum(self.space_speeds) / len(self.space_speeds)
         self.space_track_time = now
         self.space_ref = (pos, self.sys_pos_time)
+
+    def _frame_lock(self, planet, now):
+        """Measure the body's spin from the two position rows.
+
+        The HUD prints the same point in the body's frame (CamPos) and in
+        the system frame (Root): system = centre + Rz(theta(t)) planet, with
+        theta turning at the body's spin rate. At 650 km from Yela's centre
+        that rate moves the frame 100 m/s, so the rate has to be fitted
+        along with the phase: two minutes of pairs from a moving ship fix
+        the centre, the phase and the rate together (17 m residual,
+        2026-10-18). It is what turns the camera direction, which the HUD
+        gives in the system frame, into the body's frame where the
+        waypoints are. Parked, the pairs all lie on one point and nothing
+        can be told; the lock keeps its last fit, which the rate carries
+        forward. Call with the lock held.
+        """
+        if now - self.frame_fit_time < 10.0 or len(self.frame_pairs) < 6:
+            return
+        self.frame_fit_time = now
+        pts = self.frame_pairs
+        spread = max(math.dist(pts[0][1], q[1]) for q in pts)
+        if spread < FRAME_LOCK_SPREAD or pts[-1][0] - pts[0][0] < 20.0:
+            return
+        t_ref = pts[-1][0]
+        rows = [(t - t_ref, L[0], L[1], S[0], S[1]) for t, L, S in pts]
+        n = len(rows)
+
+        def cost(theta, rate):
+            a0, w = math.radians(theta), math.radians(rate)
+            sx = sy = 0.0
+            dx, dy = [], []
+            for dt, lx, ly, px, py in rows:
+                a = a0 + w * dt
+                c, s_ = math.cos(a), math.sin(a)
+                x, y = px - (c * lx - s_ * ly), py - (s_ * lx + c * ly)
+                dx.append(x)
+                dy.append(y)
+                sx += x
+                sy += y
+            cx, cy = sx / n, sy / n
+            return sum((x - cx) ** 2 + (y - cy) ** 2
+                       for x, y in zip(dx, dy)), (cx, cy)
+
+        # Coarse grid over the phase and plausible spin rates, then refine
+        # each in turn. Rates: a body's day of two hours to two weeks.
+        rates = [k * 0.0005 for k in range(-100, 101)]
+        best = min(((cost(th, r)[0], th, r) for th in range(0, 360, 2)
+                    for r in rates), key=lambda q: q[0])
+        _, theta, rate = best
+        for _ in range(3):
+            lo, hi = theta - 2.0, theta + 2.0
+            for _ in range(20):
+                m1, m2 = hi - 0.618 * (hi - lo), lo + 0.618 * (hi - lo)
+                if cost(m1, rate)[0] < cost(m2, rate)[0]:
+                    hi = m2
+                else:
+                    lo = m1
+            theta = (lo + hi) / 2
+            lo, hi = rate - 0.0005, rate + 0.0005
+            for _ in range(20):
+                m1, m2 = hi - 0.618 * (hi - lo), lo + 0.618 * (hi - lo)
+                if cost(theta, m1)[0] < cost(theta, m2)[0]:
+                    hi = m2
+                else:
+                    lo = m1
+            rate = (lo + hi) / 2
+        err, (cx, cy) = cost(theta, rate)
+        rms = math.sqrt(err / n)
+        if rms > FRAME_LOCK_RMS:
+            if self.frame_theta is None:
+                self.log(f"frame lock: rms {rms:,.0f} m over {n} pairs, not yet")
+            return
+        changed = self.frame_theta is None
+        self.frame_theta = (theta % 360.0, rate, t_ref)
+        self.frame_time = now
+        self.frame_centre = (cx, cy, 0.0)
+        if changed or n % 20 == 0:
+            self.log(f"frame lock {planet}: theta {theta % 360:.2f} deg, "
+                     f"{rate:.5f} deg/s (day {360 / abs(rate) / 3600 if rate else 0:.1f} h), "
+                     f"centre ({cx / 1000:,.1f}, {cy / 1000:,.1f}) km, rms {rms:.0f} m "
+                     f"over {n} pairs")
+
+    def frame_theta_at(self, now):
+        """The spin phase now, or None without a lock: phase carried forward
+        at the fitted rate, good for as long as the rate is."""
+        if self.frame_theta is None or now - self.frame_time > FRAME_LOCK_HOLD:
+            return None
+        theta, rate, t_ref = self.frame_theta
+        return theta + rate * (now - t_ref)
 
     def system_still(self):
         """Is the system position steady enough to be worth marking?
@@ -1916,19 +2027,6 @@ class State:
             dot = max(-1.0, min(1.0, sum(a * b for a, b in
                                          zip(cam_dir, self.space_track))))
             notes.append(f"system track {math.degrees(math.acos(dot)):.1f} deg")
-        if (self.heading is not None and now - self.heading_time < 15
-                and self.latlon is not None):
-            # The nose as a compass bearing, were CamDir in the planet frame.
-            lat, lon = (math.radians(a) for a in self.latlon)
-            east = (-math.sin(lon), math.cos(lon), 0.0)
-            north = (-math.sin(lat) * math.cos(lon),
-                     -math.sin(lat) * math.sin(lon), math.cos(lat))
-            e = sum(a * b for a, b in zip(cam_dir, east))
-            n = sum(a * b for a, b in zip(cam_dir, north))
-            brg = (math.degrees(math.atan2(e, n)) + 360.0) % 360.0
-            diff = (brg - self.heading + 540.0) % 360.0 - 180.0
-            notes.append(f"planet heading {diff:+.1f} deg "
-                         f"(nose {brg:03.0f} vs HDG {self.heading:03.0f})")
         if notes:
             self.nose_check_time = now
             self.log("nose vs " + ", ".join(notes)
@@ -2132,6 +2230,12 @@ class State:
                 self.status = "ok"
                 return
             self.pos_time = now
+            # The same point in both frames, for the frame lock below.
+            if sys_pos is not None and self.sys_pos == sys_pos:
+                self.frame_pairs.append((now, pos, sys_pos))
+                self.frame_pairs = [q for q in self.frame_pairs
+                                    if now - q[0] <= FRAME_LOCK_WINDOW]
+                self._frame_lock(planet, now)
             lat, lon, _ = to_latlon(*pos)
             if planet != self.planet:
                 self.ref = None
@@ -3751,9 +3855,9 @@ def render_target(state):
             line += f"   HDG {state.heading:03.0f}"
             # One turn hint at a time. With the nose known, the heading's
             # hint only contradicts it (parked, HDG is minutes old).
-            if nose is None:
+            if nose is None or nose == "no lock":
                 line += f"   turn {side} {abs(rel):.0f}"
-        elif nose is None:
+        elif nose is None or nose == "no lock":
             line += "   (move to get heading)"
         lines.append(line)
         lines.append(_steer_line("NOSE", nose, "(no CamDir on HUD)"))
@@ -3774,12 +3878,10 @@ def _steer(fwd, to, up_hint, mirror):
                           a[2] * b[0] - a[0] * b[2],
                           a[0] * b[1] - a[1] * b[0])
     dot = lambda a, b: sum(x * y for x, y in zip(a, b))
-    # The game's frame is the opposite hand to the textbook one: with the
-    # textbook right = fwd x up, both the turn and the pitch came out
-    # reversed in flight (deep space, 2026-10-18). up x fwd is the game's
-    # right, which flips both at once. `mirror` is a (yaw, pitch) pair of
-    # flags on top of that, should a frame ever disagree.
-    right = cross(up_hint, fwd)
+    # Right-handed, z up, y forward, x right, as the engine has it: right =
+    # fwd x up. `mirror` is a (yaw, pitch) pair of flags on top of that,
+    # for anyone whose setup disagrees.
+    right = cross(fwd, up_hint)
     rn = math.sqrt(dot(right, right))
     if rn < 1e-6:
         right, rn = (1.0, 0.0, 0.0), 1.0
@@ -3832,25 +3934,26 @@ def _nose_guidance(state, wp, now):
     """
     if state.cam_dir is None or now - state.cam_dir_time >= 5.0:
         return None
+    fwd, up = state.cam_dir, state.cam_up or (0.0, 0.0, 1.0)
     if wp.get("frame") == "system":
         if state.sys_pos is None:
             return None
         here, _ = _predicted_sys_pos(state, now)
-        up = (0.0, 0.0, 1.0)
     else:
         if state.pos is None or wp.get("planet") != state.planet:
             return None
+        # The camera is given in the system frame; the waypoint and the
+        # fix are in the body's. The frame lock's theta joins them.
+        theta = state.frame_theta_at(now)
+        if theta is None:
+            return "no lock"
+        fwd = rotate_z(fwd, -theta)
+        up = rotate_z(up, -theta)
         here = state.pos
-        rn = math.sqrt(sum(c * c for c in here))
-        up = tuple(c / rn for c in here) if rn > 0 else (0.0, 0.0, 1.0)
-    # The screen's own up, when the HUD gave the roll: then right and up in
-    # the hint are the pilot's right and up, whatever the ship's attitude.
-    if state.cam_up is not None:
-        up = state.cam_up
     to, gap = _unit_to(here, (wp["x"], wp["y"], wp["z"]))
     if to is None:
         return None
-    off, yaw, pitch = _steer(state.cam_dir, to, up,
+    off, yaw, pitch = _steer(fwd, to, up,
                              (state.cfg["mirror"], state.cfg["mirror_pitch"]))
     return {"off": off, "yaw": yaw, "pitch": pitch, "gap": gap}
 
@@ -3894,6 +3997,8 @@ def _space_guidance(state, wp, now):
 def _steer_line(label, g, missing):
     """One readout line for a guidance dict: `label  off 23  turn RIGHT 20
     pitch UP 11`, `label  on course` under 2 degrees, or `label  missing`."""
+    if g == "no lock":
+        return f"{label} (fly 300 m to lock the frame)"
     if g is None:
         return f"{label} {missing}"
     if g["off"] < 2:
@@ -3924,7 +4029,7 @@ def target_arrow(state, now=None):
         if wp is None:
             return None
         g = _nose_guidance(state, wp, now)
-        if g is not None:
+        if g is not None and g != "no lock":
             return g["yaw"], g["off"], g["pitch"]
         if wp.get("frame") == "system":
             g = _space_guidance(state, wp, now)
