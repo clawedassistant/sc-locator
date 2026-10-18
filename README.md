@@ -232,10 +232,13 @@ In practice: point the nose until `NOSE` says on course, throttle up, and
 check that `TRK` agrees. If they disagree while flying straight you are
 drifting (strafe, or momentum from a turn); fly the `TRK` hint to kill it.
 
-The compass arrow follows `NOSE` when there is one, else `TRK`, and is
-coloured by the total error (green under 10, amber under 45, red beyond).
-The marker on the rail at its right edge is the pitch: centre means level
-with the target, above means pitch up, below means pitch down.
+The pointer beside the target block is a **target ball**: a dot that sits
+where the target is relative to your nose. Right of centre means turn right,
+above means pitch up, and the further out the dot the bigger the correction
+(the ring is 90 degrees). Fly so the dot sits in the crosshair. If the target
+is behind you the ring turns red and the dot sits hollow on the edge. Colour
+is the total error: green under 10, amber under 45, red beyond. It follows
+`NOSE` when there is one, else `TRK`.
 
 `NOSE` also appears for a target on a body, next to `BRG`/`HDG`, with up
 meaning straight up from the ground.
@@ -570,6 +573,7 @@ program is closed. The ones you are most likely to change:
 | `min_move` | `20.0` | metres you must move before your heading updates |
 | `space_min_move` | `200.0` | metres you must move in deep space before your track updates |
 | `space_track_age` | `30.0` | seconds without that movement before the deep-space track is dropped |
+| `space_min_time` | `2.0` | seconds between the two readings a deep-space track and speed are measured over |
 | `game_process` | `["starcitizen.exe"]` | process names that count as the game running |
 | `tesseract_cmd` | `null` | path to your own `tesseract.exe`, to use instead of the packed one |
 

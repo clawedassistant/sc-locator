@@ -144,6 +144,7 @@ DEFAULT_CONFIG = {
     "min_move": 20.0,                    # metres moved before heading is updated
     "space_min_move": 200.0,             # metres moved in deep space before the track updates
     "space_track_age": 30.0,             # seconds a deep-space track stays usable
+    "space_min_time": 2.0,               # seconds between the readings a track is measured over
     "mirror": False,                     # flip left/right turn hint if it feels reversed
     "mirror_pitch": False,               # flip up/down in the NOSE and TRK hints
     "tesseract_cmd": None,               # e.g. r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -1263,6 +1264,10 @@ SPIN_CORRECT_DEG = 0.1
 # and a pair of matching errors is indistinguishable from a pair of truths.
 SYSTEM_RELOCK_FRAMES = 3
 
+# How far two CamDir readings in a row may differ and still both be believed.
+# A dropped minus sign mirrors the direction, which is far more than this.
+CAMDIR_AGREE_DEG = 25.0
+
 # How often the believed system position is logged, with how far it has moved
 # since the last line. Purely a measurement: the planet frame rotates with its
 # body -- 0.021 deg/s on Crusader, which sweeps a motionless ship 18,583 km/s
@@ -1487,10 +1492,12 @@ class State:
         self.space_ref = None    # (sys_pos, time) the deep-space track is measured from
         self.space_track = None  # unit vector of travel in the system frame
         self.space_speed = None  # metres per second along it
+        self.space_speeds = []   # the last few measurements, averaged
         self.space_track_time = 0.0
         self.sys_pos_time = 0.0  # when the believed system position last changed
         self.cam_dir = None      # where the camera points, unit vector, if read
         self.cam_dir_time = 0.0
+        self.cam_dir_seen = None    # the last reading, believed or not
         self.cam_dir_logged = False
         self.nose_check_time = 0.0
         self.spin_votes = []     # (body, time, star's longitude) not yet agreed
@@ -1560,6 +1567,24 @@ class State:
         if pos is None:
             return self.sys_pos
         limit = SYSTEM_LOCK_KM * 1000.0
+        # With a track, the ship can only be about where the track puts it:
+        # last position plus speed times the time since. A middle digit
+        # misread moves the reading by kilometres, which is inside the 100 km
+        # relock limit but far outside this, so it would otherwise be believed
+        # and make the distance and the hints jump for a frame. Generous on
+        # purpose (four times the expected move, plus a floor) so a boost or
+        # a hard turn is not mistaken for a misread.
+        if (self.sys_pos is not None and self.space_track is not None
+                and self.space_speed is not None
+                and now - self.space_track_time < self.cfg["space_track_age"]):
+            dt = max(0.0, now - self.sys_pos_time)
+            expect = tuple(p + t * self.space_speed * dt
+                           for p, t in zip(self.sys_pos, self.space_track))
+            slack = 4.0 * self.space_speed * dt + 500.0
+            if math.dist(pos, expect) > slack and math.dist(pos, self.sys_pos) <= limit:
+                self.log(f"system reading {math.dist(pos, expect):,.0f} m off "
+                         f"the track (slack {slack:,.0f} m), held")
+                return self.sys_pos
         near = (self.sys_pos is not None
                 and math.dist(pos, self.sys_pos) <= limit)
         if self.sys_pos is not None and not near:
@@ -1590,11 +1615,15 @@ class State:
         """Keep the deep-space track up to date. Call with the lock held.
 
         The track is the direction the believed system position moves in,
-        measured over at least `space_min_move` so OCR jitter of a few metres
-        does not swing it. It is your direction of travel, not the way the ship
-        points, exactly like the planet heading: it only exists once you have
-        moved, and it goes stale after `space_track_age` seconds so a parked
-        ship does not keep pointing the way it last flew.
+        measured over at least `space_min_move` metres AND `space_min_time`
+        seconds, so neither OCR jitter of a few metres nor the half-second
+        jitter in when a frame lands can swing it. The speed is smoothed over
+        the last few measurements, because a single one is distance over a
+        time that OCR timing makes uncertain by a large fraction. It is your
+        direction of travel, not the way the ship points, exactly like the
+        planet heading: it only exists once you have moved, and it goes
+        stale after `space_track_age` seconds so a parked ship does not keep
+        pointing the way it last flew.
 
         Losing the system lock (a quantum jump, the game stopping) drops the
         track with it, as the next position has nothing in common with the
@@ -1608,17 +1637,22 @@ class State:
             return
         if (self.space_ref is None
                 or math.dist(pos, self.space_ref[0]) > SYSTEM_LOCK_KM * 1000.0):
-            self.space_ref = (pos, now)
+            self.space_ref = (pos, self.sys_pos_time)
             self.space_track = None
+            self.space_speeds = []
             return
         ref, t0 = self.space_ref
+        if self.sys_pos_time <= t0:
+            return                          # same reading as last time
         d = math.dist(pos, ref)
-        if d < self.cfg["space_min_move"] or now <= t0:
+        dt = self.sys_pos_time - t0
+        if d < self.cfg["space_min_move"] or dt < self.cfg["space_min_time"]:
             return
         self.space_track = tuple((p - q) / d for p, q in zip(pos, ref))
-        self.space_speed = d / (now - t0)
+        self.space_speeds = (self.space_speeds + [d / dt])[-4:]
+        self.space_speed = sum(self.space_speeds) / len(self.space_speeds)
         self.space_track_time = now
-        self.space_ref = (pos, now)
+        self.space_ref = (pos, self.sys_pos_time)
 
     def system_still(self):
         """Is the system position steady enough to be worth marking?
@@ -1799,6 +1833,14 @@ class State:
     def _take_cam_dir(self, cam_dir, now):
         """Keep the camera direction current. Call with the lock held.
 
+        A reading is believed only when it agrees with the previous one to
+        within CAMDIR_AGREE_DEG. The unit-length check in the parser cannot
+        catch a dropped minus sign, which mirrors the direction and would
+        swing the nose hint by up to 180 degrees for one frame; two frames in
+        a row rarely drop the same sign. While you turn, successive readings
+        differ by a few degrees at most at the frame rate here, well inside
+        the tolerance, so this costs one frame of lag and nothing else.
+
         Logged once, and then checked against the deep-space track every
         20 s while both exist: if the two frames disagree the angle between
         them will be large and steady while flying straight, which is the
@@ -1806,6 +1848,12 @@ class State:
         """
         if cam_dir is None:
             return
+        prev = self.cam_dir_seen
+        self.cam_dir_seen = cam_dir
+        if prev is not None:
+            dot = max(-1.0, min(1.0, sum(a * b for a, b in zip(cam_dir, prev))))
+            if math.degrees(math.acos(dot)) > CAMDIR_AGREE_DEG:
+                return                      # wait for the next frame to agree
         self.cam_dir, self.cam_dir_time = cam_dir, now
         if not self.cam_dir_logged:
             self.cam_dir_logged = True
@@ -3909,7 +3957,7 @@ PIN_W, PIN_H = 30, 40
 READOUT_COLS = 53
 ARROW_COLS = 9          # the compass arrow beside the target block
 TARGET_COLS = READOUT_COLS - ARROW_COLS
-ARROW_PX = 72
+ARROW_PX = 96
 LOCATION_ROWS = 6
 SURVEY_ROWS = 5
 DIRECTIONS = "#FFFFFF"  # the survey's what-to-fly lines: apart from all else
@@ -4295,26 +4343,49 @@ def run_overlay(state, cfg):
     def draw_compass(arrow):
         """`arrow` is target_arrow's (turn, off, pitch), or None.
 
-        The arrow turns by `turn` and is coloured by `off`. In deep space
-        `pitch` is drawn as a marker on the right edge: at the middle you are
-        level with the target, above it pitch up, below it pitch down.
+        A target ball, the way a game HUD marks something off-screen: the
+        dot sits where the target is relative to your nose, right of centre
+        means turn right, above means pitch up, and flying is "put the dot
+        in the middle". The dot's distance from the centre is the angle off,
+        90 degrees at the ring, so a target straight ahead is a dot in the
+        crosshair. Past 90 degrees the target is behind you: the dot stays
+        on the ring, hollow, and the ring itself turns red. A target on a
+        body with only a heading to go on (no CamDir) is drawn on the
+        horizontal line alone.
         """
         compass.delete("all")
-        c, r = ARROW_PX / 2, ARROW_PX / 2 - 6   # room for the pitch rail
+        c, r = ARROW_PX / 2, ARROW_PX / 2 - 3
         turn, off, pitch = arrow if arrow is not None else (None, None, None)
         colour = arrow_colour(off)
-        compass.create_oval(c - r, c - r, c + r, c + r, outline="#243040")
+        behind = off is not None and off > 90
+        ring = STATUS_COLOURS["error"] if behind else "#243040"
+        compass.create_oval(c - r, c - r, c + r, c + r, outline=ring,
+                            width=2 if behind else 1)
+        # The crosshair, with a gap in the middle so the dot reads cleanly.
+        for a, b in ((c - r, c - 6), (c + 6, c + r)):
+            compass.create_line(a, c, b, c, fill="#243040")
+            compass.create_line(c, a, c, b, fill="#243040")
         compass.create_line(c, c - r - 2, c, c - r + 5, fill=DIM)
-        compass.create_polygon(arrow_polygon(turn or 0.0, c, c, r - 4),
-                               fill=colour, outline="")
-        if pitch is not None:
-            # The rail at the right edge, then the marker on it.
-            x = ARROW_PX - 3
-            compass.create_line(x, c - r, x, c + r, fill="#243040")
-            compass.create_line(x - 2, c, x + 2, c, fill=DIM)
-            y = c - r * max(-1.0, min(1.0, pitch / 90.0))
-            compass.create_rectangle(x - 2, y - 2, x + 2, y + 2,
-                                     fill=colour, outline="")
+        if off is None:
+            compass.create_oval(c - 3, c - 3, c + 3, c + 3, outline=colour)
+            return
+        # Place the dot: the angle off sets the distance from the centre,
+        # the turn/pitch split sets the direction. A 30-degree error is a
+        # third of the way out, which is what makes small corrections
+        # readable; the old arrow swung its full travel for any error.
+        yaw = turn or 0.0
+        pt = pitch or 0.0
+        ang = math.atan2(-pt, yaw) if (yaw or pt) else 0.0
+        dist = r * min(1.0, off / 90.0)
+        x, y = c + dist * math.cos(ang), c + dist * math.sin(ang)
+        if off >= 2:
+            compass.create_line(c, c, x, y, fill=colour, width=2)
+        if behind:
+            compass.create_oval(x - 5, y - 5, x + 5, y + 5, outline=colour,
+                                width=2)
+        else:
+            compass.create_oval(x - 5, y - 5, x + 5, y + 5, fill=colour,
+                                outline="")
 
     rule()
 
