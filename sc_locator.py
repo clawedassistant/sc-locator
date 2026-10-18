@@ -1329,35 +1329,41 @@ _CAMDIR_RE = re.compile(r"c[a@]m\s*d[il1]r", re.I)
 _CAMDIR_NUM_RE = re.compile(r"[-+]?\d*[.,]\d+|[-+]?\d+")
 
 
-def angles_to_forward(pitch, roll, yaw):
-    """Forward unit vector for the engine's XYZ Euler angles, in degrees.
+def angles_to_axes(yaw, pitch, roll):
+    """(forward, up) unit vectors for the HUD's CamDir angles, in degrees.
 
-    The HUD's CamDir row is `pitch roll yaw` the way CryEngine prints a
-    camera's angles (Ang3::GetAnglesXYZ): rotation about x, then y, then z,
-    applied to the camera's forward axis +y, with z up. So forward is
-    Rz(yaw) Ry(roll) Rx(pitch) (0, 1, 0). Level and unrolled, yaw alone:
-    (-sin yaw, cos yaw, 0); pitch alone lifts it to (0, cos pitch, sin pitch).
+    The row is `yaw pitch roll`: across five readings the middle value
+    stayed within a few degrees of 0 while the other two ran anywhere, and a
+    pilot's pitch is the one that stays small while roll in space is
+    arbitrary (Yela, 2026-10-18). Yaw turns about the frame's z, pitch about
+    the camera's own x, roll about its own forward; the camera looks along
+    +y and its up is +z before any rotation, so
+
+      forward = (-sin yaw cos pitch, cos yaw cos pitch, sin pitch)
+
+    and up is the same rotations applied to (0, 0, 1), roll included. The
+    up vector is what makes "turn right" and "pitch up" mean what the pilot
+    sees out of the window, however the ship is rolled.
     """
-    p, r, y = (math.radians(a) for a in (pitch, roll, yaw))
-    sp, cp, sr, cr, sy, cy = (math.sin(p), math.cos(p), math.sin(r),
-                              math.cos(r), math.sin(y), math.cos(y))
-    return (sr * sp * cy - cp * sy,
-            sr * sp * sy + cp * cy,
-            cr * sp)
+    y, p, r = (math.radians(a) for a in (yaw, pitch, roll))
+    sy, cy, sp, cp, sr, cr = (math.sin(y), math.cos(y), math.sin(p),
+                              math.cos(p), math.sin(r), math.cos(r))
+    forward = (-sy * cp, cy * cp, sp)
+    up = (sr * cy + sp * cr * sy,
+          sr * sy - sp * cr * cy,
+          cp * cr)
+    return forward, up
 
 
 def parse_cam_dir(text):
-    """Where the camera points, as a unit vector, or None.
+    """Where the camera points, as (forward, up) unit vectors, or None.
 
-    Read from the CamDir row: `CamDir: 2 1 -30 FOV: 60 ...` (Yela,
-    2026-10-18), three whole-degree angles, pitch roll yaw, turned into a
-    forward vector by angles_to_forward. Whole degrees is all the HUD
-    prints, so the nose is known to half a degree, which is plenty.
-
-    Should a build ever print a direction vector instead, three numbers of
-    unit length are taken as that. Anything else -- a misread digit that
-    makes an angle of 1234 degrees, a value with the minus sign lost is
-    sadly not detectable here -- is dropped.
+    Read from the CamDir row: `CamDir: 4 2 -121 FOV: 60 ...` (Yela,
+    2026-10-18), three whole-degree angles, yaw pitch roll, turned into
+    axes by angles_to_axes. Whole degrees is all the HUD prints, so the nose
+    is known to half a degree, which is plenty. Angles beyond 360 are a
+    misread digit and dropped; a lost minus sign is sadly not detectable
+    here, which is what the two-frames-agree rule in the reader is for.
     """
     for line in text.splitlines():
         m = _CAMDIR_RE.search(line)
@@ -1376,11 +1382,8 @@ def parse_cam_dir(text):
             v = tuple(float(t.replace(",", ".")) for t in toks[:3])
         except ValueError:
             continue
-        n = math.sqrt(sum(c * c for c in v))
-        if 0.97 <= n <= 1.03:
-            return tuple(c / n for c in v)
         if all(-360.0 <= c <= 360.0 for c in v):
-            return angles_to_forward(*v)
+            return angles_to_axes(*v)
     return None
 
 
@@ -1530,6 +1533,7 @@ class State:
         self.space_track_time = 0.0
         self.sys_pos_time = 0.0  # when the believed system position last changed
         self.cam_dir = None      # where the camera points, unit vector, if read
+        self.cam_up = None       # and which way is up on its screen
         self.cam_dir_time = 0.0
         self.cam_dir_seen = None    # the last reading, believed or not
         self.cam_dir_logged = False
@@ -1882,16 +1886,18 @@ class State:
         """
         if cam_dir is None:
             return
+        cam_dir, cam_up = cam_dir
         prev = self.cam_dir_seen
         self.cam_dir_seen = cam_dir
         if prev is not None:
             dot = max(-1.0, min(1.0, sum(a * b for a, b in zip(cam_dir, prev))))
             if math.degrees(math.acos(dot)) > CAMDIR_AGREE_DEG:
                 return                      # wait for the next frame to agree
-        self.cam_dir, self.cam_dir_time = cam_dir, now
+        self.cam_dir, self.cam_up, self.cam_dir_time = cam_dir, cam_up, now
         if not self.cam_dir_logged:
             self.cam_dir_logged = True
-            self.log(f"CamDir read: {cam_dir}")
+            self.log(f"CamDir read: forward {tuple(round(c, 3) for c in cam_dir)}"
+                     f" up {tuple(round(c, 3) for c in cam_up)}")
         if now - self.nose_check_time < 20:
             return
         notes = []
@@ -3717,7 +3723,15 @@ def render_target(state):
         else:
             lines.append(f"DIST {fmt_dist(surf)} surface / "
                          f"{fmt_dist(straight)} direct")
-        line = f"BRG  {brg:03.0f} {compass(brg)}"
+        # Elevation too: a target 11 km higher and 9 km along is mostly
+        # above you, which a compass bearing alone cannot say (Yela,
+        # 2026-10-18: flown 101 degrees away from a target while BRG and
+        # HDG were 26 degrees apart).
+        to = (wp["x"] - state.pos[0], wp["y"] - state.pos[1],
+              wp["z"] - state.pos[2])
+        elev = 0.0 if straight * r <= 0 else math.degrees(math.asin(max(-1.0, min(
+            1.0, sum(a * b for a, b in zip(to, state.pos)) / (straight * r)))))
+        line = f"BRG  {brg:03.0f} {compass(brg)} EL {elev:+.0f}"
         nose = _nose_guidance(state, wp, now)
         if state.heading is not None and now - state.heading_time < 15:
             rel = (brg - state.heading + 540.0) % 360.0 - 180.0
@@ -3819,6 +3833,10 @@ def _nose_guidance(state, wp, now):
         here = state.pos
         rn = math.sqrt(sum(c * c for c in here))
         up = tuple(c / rn for c in here) if rn > 0 else (0.0, 0.0, 1.0)
+    # The screen's own up, when the HUD gave the roll: then right and up in
+    # the hint are the pilot's right and up, whatever the ship's attitude.
+    if state.cam_up is not None:
+        up = state.cam_up
     to, gap = _unit_to(here, (wp["x"], wp["y"], wp["z"]))
     if to is None:
         return None
