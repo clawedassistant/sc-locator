@@ -1323,21 +1323,44 @@ _CAMDIR_RE = re.compile(r"c[a@]m\s*d[il1]r", re.I)
 _CAMDIR_NUM_RE = re.compile(r"[-+]?\d*[.,]\d+|[-+]?\d+")
 
 
+def angles_to_forward(pitch, roll, yaw):
+    """Forward unit vector for the engine's XYZ Euler angles, in degrees.
+
+    The HUD's CamDir row is `pitch roll yaw` the way CryEngine prints a
+    camera's angles (Ang3::GetAnglesXYZ): rotation about x, then y, then z,
+    applied to the camera's forward axis +y, with z up. So forward is
+    Rz(yaw) Ry(roll) Rx(pitch) (0, 1, 0). Level and unrolled, yaw alone:
+    (-sin yaw, cos yaw, 0); pitch alone lifts it to (0, cos pitch, sin pitch).
+    """
+    p, r, y = (math.radians(a) for a in (pitch, roll, yaw))
+    sp, cp, sr, cr, sy, cy = (math.sin(p), math.cos(p), math.sin(r),
+                              math.cos(r), math.sin(y), math.cos(y))
+    return (sr * sp * cy - cp * sy,
+            sr * sp * sy + cp * cy,
+            cr * sp)
+
+
 def parse_cam_dir(text):
     """Where the camera points, as a unit vector, or None.
 
-    Read from the CamDir row. The three values are a direction, so a correct
-    read has length 1; a misread digit, a dropped minus sign or a decimal
-    point lost by OCR breaks that, and the row is dropped rather than trusted.
-    A dropped sign is the one error that keeps the length, so this is not
-    watertight -- which is why the nose hint is checked against the track in
-    the log, and why there is a `mirror` setting.
+    Read from the CamDir row: `CamDir: 2 1 -30 FOV: 60 ...` (Yela,
+    2026-10-18), three whole-degree angles, pitch roll yaw, turned into a
+    forward vector by angles_to_forward. Whole degrees is all the HUD
+    prints, so the nose is known to half a degree, which is plenty.
+
+    Should a build ever print a direction vector instead, three numbers of
+    unit length are taken as that. Anything else -- a misread digit that
+    makes an angle of 1234 degrees, a value with the minus sign lost is
+    sadly not detectable here -- is dropped.
     """
     for line in text.splitlines():
         m = _CAMDIR_RE.search(line)
         if not m:
             continue
         tail = line[m.end():]
+        cut = re.search(r"f[o0]v", tail, re.I)
+        if cut:
+            tail = tail[:cut.start()]
         tail = re.sub(r"(?<=\d)\s+(?=[.,]\d)", "", tail)
         tail = re.sub(r"(?<=\d[.,])\s+(?=\d)", "", tail)
         toks = _CAMDIR_NUM_RE.findall(tail)
@@ -1350,6 +1373,8 @@ def parse_cam_dir(text):
         n = math.sqrt(sum(c * c for c in v))
         if 0.97 <= n <= 1.03:
             return tuple(c / n for c in v)
+        if all(-360.0 <= c <= 360.0 for c in v):
+            return angles_to_forward(*v)
     return None
 
 
@@ -1858,14 +1883,32 @@ class State:
         if not self.cam_dir_logged:
             self.cam_dir_logged = True
             self.log(f"CamDir read: {cam_dir}")
+        if now - self.nose_check_time < 20:
+            return
+        notes = []
         if (self.space_track is not None
-                and now - self.space_track_time < self.cfg["space_track_age"]
-                and now - self.nose_check_time >= 20):
-            self.nose_check_time = now
+                and now - self.space_track_time < self.cfg["space_track_age"]):
             dot = max(-1.0, min(1.0, sum(a * b for a, b in
                                          zip(cam_dir, self.space_track))))
-            self.log(f"nose vs track: {math.degrees(math.acos(dot)):.1f} deg "
-                     f"(0 when flying straight and looking ahead)")
+            notes.append(f"system track {math.degrees(math.acos(dot)):.1f} deg")
+        if (self.heading is not None and now - self.heading_time < 15
+                and self.latlon is not None):
+            # The nose as a compass bearing, were CamDir in the planet frame.
+            lat, lon = (math.radians(a) for a in self.latlon)
+            east = (-math.sin(lon), math.cos(lon), 0.0)
+            north = (-math.sin(lat) * math.cos(lon),
+                     -math.sin(lat) * math.sin(lon), math.cos(lat))
+            e = sum(a * b for a, b in zip(cam_dir, east))
+            n = sum(a * b for a, b in zip(cam_dir, north))
+            brg = (math.degrees(math.atan2(e, n)) + 360.0) % 360.0
+            diff = (brg - self.heading + 540.0) % 360.0 - 180.0
+            notes.append(f"planet heading {diff:+.1f} deg "
+                         f"(nose {brg:03.0f} vs HDG {self.heading:03.0f})")
+        if notes:
+            self.nose_check_time = now
+            self.log("nose vs " + ", ".join(notes)
+                     + " -- near 0 for whichever frame CamDir is in, "
+                     "when flying straight and looking ahead")
 
     def update(self, res, heights=None, system=None, location=None,
                sys_pos=None, cam_dir=None):
@@ -4059,11 +4102,20 @@ def waypoint_groups(state):
                              None, None))
                 continue
             # LAT/LON are the waypoint's own, so every body has them, fix or not.
-            tlat, tlon, _ = to_latlon(w["x"], w["y"], w["z"])
+            tlat, tlon, tr = to_latlon(w["x"], w["y"], w["z"])
             if body == here_body and pos is not None and latlon is not None:
-                rows.append((w["name"],
-                             surface_distance(latlon[0], latlon[1], tlat, tlon,
-                                              radius),
+                # Over the ground for two points on it. For a ship parked in
+                # orbit, or when you are up there yourself, the ground track
+                # is not the trip: two ships 13 km apart 330 km up have
+                # ground tracks 340 m apart (Yela, 2026-10-18). Straight line
+                # then, like the target block.
+                r_here = math.sqrt(sum(c * c for c in pos))
+                in_space = (above_space_line(r_here, radius, state.cfg)
+                            or above_space_line(tr, radius, state.cfg))
+                dist = (math.dist(pos, (w["x"], w["y"], w["z"])) if in_space
+                        else surface_distance(latlon[0], latlon[1], tlat, tlon,
+                                              radius))
+                rows.append((w["name"], dist,
                              bearing(latlon[0], latlon[1], tlat, tlon),
                              (tlat, tlon)))
             else:
