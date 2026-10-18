@@ -1501,6 +1501,7 @@ class State:
         self.agl = None          # height over that terrain, m; None if unsure
         self.replaced = None     # (planet, record it replaced) until reviewed
         self.heights_bad = 0     # height reads dropped for failing the identity
+        self.held_pos = 0        # position reads held for the same reason, after a jump
         self.heights_time = 0.0  # when heights were last believed
         self.heights_conflict = False   # last frame's heights contradicted it
         self.heights_seen = None # (elev, alt, |pos| - radius, radius) when they did
@@ -2055,6 +2056,32 @@ class State:
                 self.heights_conflict = False
             if now - self.heights_time > HEIGHT_HOLD_SECONDS:
                 self.elev = self.agl = None
+            # Judged against the last position the heights vouched for, not
+            # the last one read: a frame with its heights unread carries a
+            # position nothing has checked, and measuring from a misread one
+            # dropped good frames after it (Harper's Point, 2026-10-14).
+            ref = self.checked_pos
+            jumped = (ref is not None and ref[0] == planet
+                      and too_fast(ref[1], ref[2], pos, now))
+            if fresh_elev is not None:
+                self.checked_pos = (planet, pos, now)
+            # A reading whose heights contradict it, and which has jumped
+            # from the last one the heights vouched for, is a misread digit
+            # in the CamPos row: 22 m from a waypoint one frame, 400 km the
+            # next, then 250 km (Yela, 2026-10-18). Held rather than shown.
+            # The fix is not stale -- the HUD is being read, only refused --
+            # and on a parked ship a misread that repeats frame after frame
+            # (the image does not change) stays held, which is the right
+            # answer: the ship is where the last good reading put it.
+            if self.heights_conflict and jumped and self.pos is not None:
+                self.held_pos += 1
+                if self.held_pos <= 3 or self.held_pos % 50 == 0:
+                    self.log(f"position held: heights disagree and it jumped "
+                             f"{math.dist(ref[1], pos):,.0f} m from the last "
+                             f"checked fix ({self.held_pos} so far)")
+                self.fix_time = now
+                self.status = "ok"
+                return
             lat, lon, _ = to_latlon(*pos)
             if planet != self.planet:
                 self.ref = None
@@ -2067,15 +2094,6 @@ class State:
                     self.heading = bearing(self.ref[0], self.ref[1], lat, lon)
                     self.heading_time = now
                     self.ref = (lat, lon)
-            # Judged against the last position the heights vouched for, not
-            # the last one read: a frame with its heights unread carries a
-            # position nothing has checked, and measuring from a misread one
-            # dropped good frames after it (Harper's Point, 2026-10-14).
-            ref = self.checked_pos
-            jumped = (ref is not None and ref[0] == planet
-                      and too_fast(ref[1], ref[2], pos, now))
-            if fresh_elev is not None:
-                self.checked_pos = (planet, pos, now)
             self.planet, self.radius, self.pos = planet, radius, pos
             self.latlon = (lat, lon)
             self.fix_time = now
