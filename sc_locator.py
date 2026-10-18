@@ -1383,7 +1383,8 @@ def parse_cam_dir(text):
         except ValueError:
             continue
         if all(-360.0 <= c <= 360.0 for c in v):
-            return angles_to_axes(*v)
+            fwd, up = angles_to_axes(*v)
+            return fwd, up, v
     return None
 
 
@@ -1536,6 +1537,7 @@ class State:
         self.cam_up = None       # and which way is up on its screen
         self.cam_dir_time = 0.0
         self.cam_dir_seen = None    # the last reading, believed or not
+        self.camdir_log_time = 0.0
         self.cam_dir_logged = False
         self.nose_check_time = 0.0
         self.spin_votes = []     # (body, time, star's longitude) not yet agreed
@@ -1886,7 +1888,15 @@ class State:
         """
         if cam_dir is None:
             return
-        cam_dir, cam_up = cam_dir
+        cam_dir, cam_up, raw = cam_dir
+        # The row as printed, with both positions, every 2 s: the data that
+        # settles which frame and which angle order the HUD uses, from one
+        # flight with a few turns in it. Compact, as the log is for bug
+        # reports and this is one of them.
+        if now - self.camdir_log_time >= 2.0:
+            self.camdir_log_time = now
+            self.log(f"camdir {raw[0]:.0f} {raw[1]:.0f} {raw[2]:.0f} planet "
+                     f"{self.pos} sys {self.sys_pos}")
         prev = self.cam_dir_seen
         self.cam_dir_seen = cam_dir
         if prev is not None:
