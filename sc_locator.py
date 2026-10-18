@@ -145,6 +145,7 @@ DEFAULT_CONFIG = {
     "space_min_move": 200.0,             # metres moved in deep space before the track updates
     "space_track_age": 30.0,             # seconds a deep-space track stays usable
     "mirror": False,                     # flip left/right turn hint if it feels reversed
+    "mirror_pitch": False,               # flip up/down in the NOSE and TRK hints
     "tesseract_cmd": None,               # e.g. r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     # The pin is anchored to a corner, not placed at an absolute point, so the
     # panel can grow without walking off the screen. "br" also keeps it clear
@@ -3602,7 +3603,12 @@ def _steer(fwd, to, up_hint, mirror):
                           a[2] * b[0] - a[0] * b[2],
                           a[0] * b[1] - a[1] * b[0])
     dot = lambda a, b: sum(x * y for x, y in zip(a, b))
-    right = cross(fwd, up_hint)
+    # The game's frame is the opposite hand to the textbook one: with the
+    # textbook right = fwd x up, both the turn and the pitch came out
+    # reversed in flight (deep space, 2026-10-18). up x fwd is the game's
+    # right, which flips both at once. `mirror` is a (yaw, pitch) pair of
+    # flags on top of that, should a frame ever disagree.
+    right = cross(up_hint, fwd)
     rn = math.sqrt(dot(right, right))
     if rn < 1e-6:
         right, rn = (1.0, 0.0, 0.0), 1.0
@@ -3612,7 +3618,8 @@ def _steer(fwd, to, up_hint, mirror):
     yaw = math.degrees(math.atan2(r, f))
     pitch = math.degrees(math.asin(max(-1.0, min(1.0, u))))
     off = math.degrees(math.acos(max(-1.0, min(1.0, f))))
-    return off, (-yaw if mirror else yaw), pitch
+    flip_yaw, flip_pitch = mirror
+    return off, (-yaw if flip_yaw else yaw), (-pitch if flip_pitch else pitch)
 
 
 def _unit_to(frm, to):
@@ -3668,7 +3675,8 @@ def _nose_guidance(state, wp, now):
     to, gap = _unit_to(here, (wp["x"], wp["y"], wp["z"]))
     if to is None:
         return None
-    off, yaw, pitch = _steer(state.cam_dir, to, up, state.cfg["mirror"])
+    off, yaw, pitch = _steer(state.cam_dir, to, up,
+                             (state.cfg["mirror"], state.cfg["mirror_pitch"]))
     return {"off": off, "yaw": yaw, "pitch": pitch, "gap": gap}
 
 
@@ -3700,7 +3708,7 @@ def _space_guidance(state, wp, now):
     if to is None:
         return None
     off, yaw, pitch = _steer(state.space_track, to, (0.0, 0.0, 1.0),
-                             state.cfg["mirror"])
+                             (state.cfg["mirror"], state.cfg["mirror_pitch"]))
     f = sum(a * b for a, b in zip(to, state.space_track))
     closing = f * state.space_speed
     eta = gap / closing if closing > 0 else None

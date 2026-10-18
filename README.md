@@ -559,7 +559,8 @@ program is closed. The ones you are most likely to change:
 | `overlay_anchor` | `"br"` | corner the pin sits in: `br`, `bl`, `tr`, `tl` |
 | `overlay_margin` | `[20, 20]` | distance in pixels from that corner |
 | `alpha` | `0.85` | overlay opacity (0 to 1) |
-| `mirror` | `false` | swap left/right in the turn hint |
+| `mirror` | `false` | swap left/right in the turn hints |
+| `mirror_pitch` | `false` | swap up/down in the NOSE and TRK hints |
 | `interval` | `0.5` | seconds between screen reads. One OCR pass takes a few tenths of a second, which is the floor; 0.3 gives the fastest updates at some CPU cost |
 | `idle_interval` | `5.0` | seconds between checks for the game while it is not running |
 | `stale_after` | `3.0` | seconds without a good reading before the fix shows as stale |
