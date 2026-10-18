@@ -3684,17 +3684,21 @@ def render_target(state):
             lines.append(f"DIST {fmt_dist(surf)} surface / "
                          f"{fmt_dist(straight)} direct")
         line = f"BRG  {brg:03.0f} {compass(brg)}"
+        nose = _nose_guidance(state, wp, now)
         if state.heading is not None and now - state.heading_time < 15:
             rel = (brg - state.heading + 540.0) % 360.0 - 180.0
             if state.cfg["mirror"]:
                 rel = -rel
             side = "RIGHT" if rel > 0 else "LEFT"
-            line += f"   HDG {state.heading:03.0f}   turn {side} {abs(rel):.0f}"
-        else:
+            line += f"   HDG {state.heading:03.0f}"
+            # One turn hint at a time. With the nose known, the heading's
+            # hint only contradicts it (parked, HDG is minutes old).
+            if nose is None:
+                line += f"   turn {side} {abs(rel):.0f}"
+        elif nose is None:
             line += "   (move to get heading)"
         lines.append(line)
-        lines.append(_steer_line("NOSE", _nose_guidance(state, wp, now),
-                                 "(no CamDir on HUD)"))
+        lines.append(_steer_line("NOSE", nose, "(no CamDir on HUD)"))
         lines.append(f"ALT  {fmt_dist(tr - r)} vs you")
         return chr(10).join(lines)
 
