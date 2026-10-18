@@ -210,35 +210,42 @@ Mm (megametres), Gm (gigametres).
 To save one, hold still for a moment: out there nothing else can confirm the
 reading, so the position must be steady first.
 
-**Flying to one.** Target it and start moving. Once you have gone 200 m the
-program knows your track (the direction you are actually moving) and steers
-you from that:
+**Flying to one.** Target it. The target block then shows:
 
 ```
 TARGET wreck
 DEEP SPACE in stanton
-DIST 61.91 Mm direct
+DIST 61.91 Mm direct  (est)
+NOSE off 8  turn LEFT 7  pitch UP 3
 TRK  off 23  turn RIGHT 20  pitch UP 11
 SPD  1,150 m/s   closing   ETA 14h 57m
 ```
 
-| line  | meaning                                                                                                  |
-| ----- | -------------------------------------------------------------------------------------------------------- |
-| `TRK` | how far off the target your track is, split into a turn (left/right) and a pitch (up/down). `on course` under 2 degrees. `(move to get track)` until you have moved. |
-| `SPD` | your speed along the track, whether the gap is closing or opening, and the time to arrive at that rate. `OPENING` means you are flying away: turn around. |
+| line   | meaning                                                                                                  |
+| ------ | -------------------------------------------------------------------------------------------------------- |
+| `NOSE` | where you are **looking** (the HUD's `CamDir` row) against the target: how far off, split into a turn (left/right) and a pitch (up/down). Works standing still and updates every read. `on course` under 2 degrees. |
+| `TRK`  | the same for your **track**, the direction you are actually moving. Needs 200 m of movement first; `(move to get track)` until then. |
+| `SPD`  | your speed along the track, whether the gap is closing or opening, and the time to arrive at that rate. `OPENING` means you are flying away: turn around. |
+| `(est)` | the distance is carried forward along your track between HUD reads, so it counts down smoothly instead of in steps. |
 
-The compass arrow turns with the turn hint and is coloured by the total
-error (green under 10, amber under 45, red beyond). The marker on the rail
-at its right edge is the pitch: centre means level with the target, above
-means pitch up, below means pitch down.
+In practice: point the nose until `NOSE` says on course, throttle up, and
+check that `TRK` agrees. If they disagree while flying straight you are
+drifting (strafe, or momentum from a turn); fly the `TRK` hint to kill it.
 
-Two things to know. The track comes from how your position changes, so it is
-only right while you are flying straight; it goes stale after 30 seconds
-without 200 m of movement, so a parked ship shows `(move to get track)` again.
-And the system frame has no cockpit in it, so "up" is the system's own up
-(the axis the planets spin about). Fly roughly level with the planets' orbits
-and left/right/up/down mean what they say; rolled 90 degrees they swap. If
-left and right are simply reversed, set `"mirror": true`.
+The compass arrow follows `NOSE` when there is one, else `TRK`, and is
+coloured by the total error (green under 10, amber under 45, red beyond).
+The marker on the rail at its right edge is the pitch: centre means level
+with the target, above means pitch up, below means pitch down.
+
+`NOSE` also appears for a target on a body, next to `BRG`/`HDG`, with up
+meaning straight up from the ground.
+
+Two things to know. The system frame has no cockpit in it, so "up" out there
+is the system's own up (the axis the planets spin about). Fly roughly level
+with the planets' orbits and left/right/up/down mean what they say; rolled 90
+degrees they swap. If left and right are simply reversed, set `"mirror":
+true`. And `CamDir` is the camera, not the ship: in a third-person view, or
+looking around the cockpit, `NOSE` follows your eyes.
 
 Quantum travel freezes the HUD's system position for the whole jump, so the
 track is lost in a jump and comes back a few seconds after you drop out.
@@ -553,7 +560,7 @@ program is closed. The ones you are most likely to change:
 | `overlay_margin` | `[20, 20]` | distance in pixels from that corner |
 | `alpha` | `0.85` | overlay opacity (0 to 1) |
 | `mirror` | `false` | swap left/right in the turn hint |
-| `interval` | `1.0` | seconds between screen reads |
+| `interval` | `0.5` | seconds between screen reads. One OCR pass takes a few tenths of a second, which is the floor; 0.3 gives the fastest updates at some CPU cost |
 | `idle_interval` | `5.0` | seconds between checks for the game while it is not running |
 | `stale_after` | `3.0` | seconds without a good reading before the fix shows as stale |
 | `space_line_m` | `100000` | height (m) above which it says "In Space near …" |

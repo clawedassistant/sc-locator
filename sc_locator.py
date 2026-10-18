@@ -102,7 +102,7 @@ DEFAULT_CONFIG = {
     # is promoted to the front. A faint row and a glaring one want different
     # cuts, and both occur within a few seconds of each other.
     "contrast_cuts": [28, 18, 40, 12],
-    "interval": 1.0,                     # seconds between captures
+    "interval": 0.5,                     # seconds between captures (OCR time sets the floor)
     # With the game closed there is nothing to read, and each miss costs one
     # Tesseract process per contrast cut in the ladder. Idle polling only looks
     # for the game, which is why it can be this slow without being noticed.
@@ -1313,6 +1313,40 @@ def _sys_values(tail):
     return None
 
 
+_CAMDIR_RE = re.compile(r"c[a@]m\s*d[il1]r", re.I)
+_CAMDIR_NUM_RE = re.compile(r"[-+]?\d*[.,]\d+|[-+]?\d+")
+
+
+def parse_cam_dir(text):
+    """Where the camera points, as a unit vector, or None.
+
+    Read from the CamDir row. The three values are a direction, so a correct
+    read has length 1; a misread digit, a dropped minus sign or a decimal
+    point lost by OCR breaks that, and the row is dropped rather than trusted.
+    A dropped sign is the one error that keeps the length, so this is not
+    watertight -- which is why the nose hint is checked against the track in
+    the log, and why there is a `mirror` setting.
+    """
+    for line in text.splitlines():
+        m = _CAMDIR_RE.search(line)
+        if not m:
+            continue
+        tail = line[m.end():]
+        tail = re.sub(r"(?<=\d)\s+(?=[.,]\d)", "", tail)
+        tail = re.sub(r"(?<=\d[.,])\s+(?=\d)", "", tail)
+        toks = _CAMDIR_NUM_RE.findall(tail)
+        if len(toks) < 3:
+            continue
+        try:
+            v = tuple(float(t.replace(",", ".")) for t in toks[:3])
+        except ValueError:
+            continue
+        n = math.sqrt(sum(c * c for c in v))
+        if 0.97 <= n <= 1.03:
+            return tuple(c / n for c in v)
+    return None
+
+
 def parse_system_pos(text):
     """System-frame position in metres, or None.
 
@@ -1453,6 +1487,11 @@ class State:
         self.space_track = None  # unit vector of travel in the system frame
         self.space_speed = None  # metres per second along it
         self.space_track_time = 0.0
+        self.sys_pos_time = 0.0  # when the believed system position last changed
+        self.cam_dir = None      # where the camera points, unit vector, if read
+        self.cam_dir_time = 0.0
+        self.cam_dir_logged = False
+        self.nose_check_time = 0.0
         self.spin_votes = []     # (body, time, star's longitude) not yet agreed
         self.system = None       # which star system the body is in
         self.location = None     # the game's own name for the place, if read
@@ -1756,15 +1795,42 @@ class State:
             else:
                 self.log("cannot tell if the game is running - capturing anyway")
 
+    def _take_cam_dir(self, cam_dir, now):
+        """Keep the camera direction current. Call with the lock held.
+
+        Logged once, and then checked against the deep-space track every
+        20 s while both exist: if the two frames disagree the angle between
+        them will be large and steady while flying straight, which is the
+        evidence to go on if the nose hint ever points wrong.
+        """
+        if cam_dir is None:
+            return
+        self.cam_dir, self.cam_dir_time = cam_dir, now
+        if not self.cam_dir_logged:
+            self.cam_dir_logged = True
+            self.log(f"CamDir read: {cam_dir}")
+        if (self.space_track is not None
+                and now - self.space_track_time < self.cfg["space_track_age"]
+                and now - self.nose_check_time >= 20):
+            self.nose_check_time = now
+            dot = max(-1.0, min(1.0, sum(a * b for a, b in
+                                         zip(cam_dir, self.space_track))))
+            self.log(f"nose vs track: {math.degrees(math.acos(dot)):.1f} deg "
+                     f"(0 when flying straight and looking ahead)")
+
     def update(self, res, heights=None, system=None, location=None,
-               sys_pos=None):
+               sys_pos=None, cam_dir=None):
         now = time.time()
         with self.lock:
             # Tracked whatever else the frame held: it is the only position
             # there is with no body in range, and it is what a waypoint out
             # there is measured against.
+            before = self.sys_pos
             self.sys_pos = self._settle_system_pos(sys_pos, now)
+            if self.sys_pos is not None and self.sys_pos != before:
+                self.sys_pos_time = now
             self._track_space(now)
+            self._take_cam_dir(cam_dir, now)
             self._log_system_drift(now)
             # A place with no ground is sampled whether or not a body is in
             # range, and only on a reading this frame produced.
@@ -3459,35 +3525,27 @@ def render_target(state):
         if wp.get("frame") == "system":
             # Out between bodies there is no surface to measure over and no
             # north to bear from. What there is: the straight-line distance,
-            # and once you have moved, your track through the system frame,
-            # which the target direction can be measured against.
+            # where the camera points (NOSE, from the HUD's CamDir row, so it
+            # works standing still) and, once you have moved, your track
+            # through the system frame (TRK).
             lines.append(f"DEEP SPACE in {wp.get('system', 'unknown')}")
             if state.sys_pos is None:
                 lines.append("no system position yet")
                 return chr(10).join(lines)
-            gap = math.dist(state.sys_pos, (wp["x"], wp["y"], wp["z"]))
-            lines.append(f"DIST {fmt_dist(gap)} direct")
+            here, est = _predicted_sys_pos(state, now)
+            gap = math.dist(here, (wp["x"], wp["y"], wp["z"]))
+            lines.append(f"DIST {fmt_dist(gap)} direct" + ("  (est)" if est else ""))
+            lines.append(_steer_line("NOSE", _nose_guidance(state, wp, now),
+                                     "(no CamDir on HUD)"))
             g = _space_guidance(state, wp, now)
-            if g is None:
-                lines.append("TRK  (move to get track)")
-                return chr(10).join(lines)
-            if g["off"] < 2:
-                trk = "TRK  on course"
-            else:
-                trk = f"TRK  off {g['off']:.0f}"
-                if abs(g["yaw"]) >= 1:
-                    trk += (f"  turn {'RIGHT' if g['yaw'] > 0 else 'LEFT'} "
-                            f"{abs(g['yaw']):.0f}")
-                if abs(g["pitch"]) >= 1:
-                    trk += (f"  pitch {'UP' if g['pitch'] > 0 else 'DOWN'} "
-                            f"{abs(g['pitch']):.0f}")
-            lines.append(trk)
-            spd = f"SPD  {g['speed']:,.0f} m/s"
-            if g["closing"] > 0:
-                spd += f"   closing   ETA {spin.fmt_duration(g['eta'])}"
-            elif g["closing"] < 0:
-                spd += "   OPENING - turn around"
-            lines.append(spd)
+            lines.append(_steer_line("TRK ", g, "(move to get track)"))
+            if g is not None:
+                spd = f"SPD  {g['speed']:,.0f} m/s"
+                if g["closing"] > 0:
+                    spd += f"   closing   ETA {spin.fmt_duration(g['eta'])}"
+                elif g["closing"] < 0:
+                    spd += "   OPENING - turn around"
+                lines.append(spd)
             return chr(10).join(lines)
 
         tlat, tlon, tr = to_latlon(wp["x"], wp["y"], wp["z"])
@@ -3525,8 +3583,93 @@ def render_target(state):
         else:
             line += "   (move to get heading)"
         lines.append(line)
+        lines.append(_steer_line("NOSE", _nose_guidance(state, wp, now),
+                                 "(no CamDir on HUD)"))
         lines.append(f"ALT  {fmt_dist(tr - r)} vs you")
         return chr(10).join(lines)
+
+
+def _steer(fwd, to, up_hint, mirror):
+    """Yaw and pitch from a forward vector to a target direction.
+
+    `fwd` and `to` are unit vectors in the same frame; `up_hint` says which
+    way is up in that frame. Returns (off, yaw, pitch) in degrees: `off` is
+    the whole angle between them, `yaw` is + right and - left, `pitch` is + up
+    and - down. right = fwd x up, up = right x fwd. A forward straight along
+    the hint has no "right"; the x axis stands in for it.
+    """
+    cross = lambda a, b: (a[1] * b[2] - a[2] * b[1],
+                          a[2] * b[0] - a[0] * b[2],
+                          a[0] * b[1] - a[1] * b[0])
+    dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+    right = cross(fwd, up_hint)
+    rn = math.sqrt(dot(right, right))
+    if rn < 1e-6:
+        right, rn = (1.0, 0.0, 0.0), 1.0
+    right = tuple(c / rn for c in right)
+    up = cross(right, fwd)
+    f, r, u = dot(to, fwd), dot(to, right), dot(to, up)
+    yaw = math.degrees(math.atan2(r, f))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, u))))
+    off = math.degrees(math.acos(max(-1.0, min(1.0, f))))
+    return off, (-yaw if mirror else yaw), pitch
+
+
+def _unit_to(frm, to):
+    d = [t - p for t, p in zip(to, frm)]
+    n = math.sqrt(sum(c * c for c in d))
+    return (None, 0.0) if n <= 0 else ([c / n for c in d], n)
+
+
+def _predicted_sys_pos(state, now):
+    """The system position now, carried forward along the track since the
+    last read. Call with the lock held. Returns (pos, estimated).
+
+    OCR gives a position about once a second and the Root row less often
+    than that; between reads the ship keeps moving, so the distance would
+    otherwise tick down in steps. The prediction is only ever a few seconds
+    of dead reckoning and is dropped as soon as the track goes stale.
+    """
+    pos = state.sys_pos
+    if (state.space_track is None or state.space_speed is None
+            or now - state.space_track_time >= state.cfg["space_track_age"]):
+        return pos, False
+    dt = now - state.sys_pos_time
+    if dt <= 0 or dt > state.cfg["space_track_age"]:
+        return pos, False
+    step = state.space_speed * dt
+    return tuple(p + t * step for p, t in zip(pos, state.space_track)), True
+
+
+def _nose_guidance(state, wp, now):
+    """How to steer for the target from where the camera points, or None.
+
+    Call with the lock held. Needs a CamDir read in the last few seconds and
+    a position in the target's frame: the system position for a deep-space
+    target, the planet-local one for a target on a body. CamDir is taken to
+    be in that same frame, which the "nose vs track" log line is there to
+    confirm. Up is the system z axis in deep space and straight up from the
+    body's centre on a planet. Returns a dict like _space_guidance, without
+    the speed fields.
+    """
+    if state.cam_dir is None or now - state.cam_dir_time >= 5.0:
+        return None
+    if wp.get("frame") == "system":
+        if state.sys_pos is None:
+            return None
+        here, _ = _predicted_sys_pos(state, now)
+        up = (0.0, 0.0, 1.0)
+    else:
+        if state.pos is None or wp.get("planet") != state.planet:
+            return None
+        here = state.pos
+        rn = math.sqrt(sum(c * c for c in here))
+        up = tuple(c / rn for c in here) if rn > 0 else (0.0, 0.0, 1.0)
+    to, gap = _unit_to(here, (wp["x"], wp["y"], wp["z"]))
+    if to is None:
+        return None
+    off, yaw, pitch = _steer(state.cam_dir, to, up, state.cfg["mirror"])
+    return {"off": off, "yaw": yaw, "pitch": pitch, "gap": gap}
 
 
 def _space_guidance(state, wp, now):
@@ -3552,44 +3695,44 @@ def _space_guidance(state, wp, now):
     if (state.sys_pos is None or state.space_track is None
             or now - state.space_track_time >= state.cfg["space_track_age"]):
         return None
-    fwd = state.space_track
-    to = [t - p for t, p in zip((wp["x"], wp["y"], wp["z"]), state.sys_pos)]
-    gap = math.sqrt(sum(c * c for c in to))
-    if gap <= 0:
+    here, _ = _predicted_sys_pos(state, now)
+    to, gap = _unit_to(here, (wp["x"], wp["y"], wp["z"]))
+    if to is None:
         return None
-    to = [c / gap for c in to]
-    # right = forward x up, up = right x forward, with system z as up. A track
-    # straight up or down has no "right"; fall back to the x axis for it.
-    rx, ry, rz = (fwd[1], -fwd[0], 0.0)
-    rn = math.hypot(rx, ry)
-    if rn < 1e-9:
-        rx, ry, rz, rn = 1.0, 0.0, 0.0, 1.0
-    right = (rx / rn, ry / rn, rz / rn)
-    up = (right[1] * fwd[2] - right[2] * fwd[1],
-          right[2] * fwd[0] - right[0] * fwd[2],
-          right[0] * fwd[1] - right[1] * fwd[0])
-    dot = lambda a, b: sum(x * y for x, y in zip(a, b))
-    f, r, u = dot(to, fwd), dot(to, right), dot(to, up)
-    yaw = math.degrees(math.atan2(r, f))
-    pitch = math.degrees(math.asin(max(-1.0, min(1.0, u))))
-    off = math.degrees(math.acos(max(-1.0, min(1.0, f))))
-    if state.cfg["mirror"]:
-        yaw = -yaw
+    off, yaw, pitch = _steer(state.space_track, to, (0.0, 0.0, 1.0),
+                             state.cfg["mirror"])
+    f = sum(a * b for a, b in zip(to, state.space_track))
     closing = f * state.space_speed
     eta = gap / closing if closing > 0 else None
     return {"off": off, "yaw": yaw, "pitch": pitch, "speed": state.space_speed,
             "closing": closing, "eta": eta, "gap": gap}
 
 
+def _steer_line(label, g, missing):
+    """One readout line for a guidance dict: `label  off 23  turn RIGHT 20
+    pitch UP 11`, `label  on course` under 2 degrees, or `label  missing`."""
+    if g is None:
+        return f"{label} {missing}"
+    if g["off"] < 2:
+        return f"{label} on course"
+    line = f"{label} off {g['off']:.0f}"
+    if abs(g["yaw"]) >= 1:
+        line += f"  turn {'RIGHT' if g['yaw'] > 0 else 'LEFT'} {abs(g['yaw']):.0f}"
+    if abs(g["pitch"]) >= 1:
+        line += f"  pitch {'UP' if g['pitch'] > 0 else 'DOWN'} {abs(g['pitch']):.0f}"
+    return line
+
+
 def target_arrow(state, now=None):
     """(turn, off, pitch) for the compass arrow, or None.
 
-    `turn` is degrees to turn, + right and - left; `off` is how far the track
-    is from the target in all, which sets the colour; `pitch` is + up and
-    - down, None for a target on a body where the arrow is flat.
+    `turn` is degrees to turn, + right and - left; `off` is how far off the
+    target you point in all, which sets the colour; `pitch` is + up and
+    - down, None when there is no pitch to show.
 
-    None whenever the text block would say it cannot tell: no target, no fix
-    on the target's body, no recent heading, or no deep-space track.
+    The nose (CamDir) is used whenever it is available: it answers at once
+    and while standing still. Failing that, the deep-space track, or on a
+    body the heading, which both need you to have moved.
     """
     now = time.time() if now is None else now
     with state.lock:
@@ -3597,6 +3740,9 @@ def target_arrow(state, now=None):
                   None)
         if wp is None:
             return None
+        g = _nose_guidance(state, wp, now)
+        if g is not None:
+            return g["yaw"], g["off"], g["pitch"]
         if wp.get("frame") == "system":
             g = _space_guidance(state, wp, now)
             if g is None:
@@ -3682,19 +3828,27 @@ def ocr_worker(state, cfg, stop):
                 continue
             try:
                 raw = grab_region(sct, cfg)
-                res = sys_pos = None
+                res = sys_pos = cam_dir = None
+                with state.lock:
+                    deep = state.pos is None and state.sys_pos is not None
                 for i, thr in enumerate(ladder):
                     text = pytesseract.image_to_string(
                         preprocess(raw, cfg, thr), config=TESS_CONFIG)
-                    # From the first cut that reads it. With no body in range
-                    # every cut is tried, and the last is the poorest.
+                    # From the first cut that reads it.
                     sys_pos = sys_pos or parse_system_pos(text)
+                    cam_dir = cam_dir or parse_cam_dir(text)
                     res = parse_readout(text, cfg["default_radius"])
                     if res is not None:
                         if i:
                             state.log(f"contrast cut {ladder[0]} failed, "
                                       f"{thr} worked - switching")
                             ladder.insert(0, ladder.pop(i))
+                        break
+                    # Out between bodies there is no planet readout to find,
+                    # so once the Root row is read the remaining cuts would
+                    # only cost time: each is a Tesseract run, and the frame
+                    # rate out there is what the guidance lives on.
+                    if deep and sys_pos is not None and cam_dir is not None:
                         break
                 state.set_hud_visible(hud_visible(text))
                 row = next((ln for ln in text.splitlines()
@@ -3707,7 +3861,7 @@ def ocr_worker(state, cfg, stop):
                              parse_heights(text) if res else None,
                              parse_system(text) if res else None,
                              parse_location(text),
-                             sys_pos)
+                             sys_pos, cam_dir)
             except Exception as exc:
                 state.set_error(str(exc))
             stop.wait(max(0.05, cfg["interval"] - (time.time() - t0)))
@@ -3752,7 +3906,7 @@ LOCATION_ROWS = 6
 SURVEY_ROWS = 5
 DIRECTIONS = "#FFFFFF"  # the survey's what-to-fly lines: apart from all else
 TURN_COLOUR = "#FFE45C"  # and as a corner comes up: catches the eye
-TARGET_ROWS = 5
+TARGET_ROWS = 6
 REPORT_ROWS = 14        # the body analysis, in its block under the status
 NO_LABEL = "(not labelled)"
 NO_STATION = "(no station)"
