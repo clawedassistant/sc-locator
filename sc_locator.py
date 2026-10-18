@@ -142,6 +142,8 @@ DEFAULT_CONFIG = {
     "stale_after": 3.0,                # seconds before a fix is flagged stale
     "default_radius": 1000000.0,         # used when the zone is not in BODY_RADII
     "min_move": 20.0,                    # metres moved before heading is updated
+    "space_min_move": 200.0,             # metres moved in deep space before the track updates
+    "space_track_age": 30.0,             # seconds a deep-space track stays usable
     "mirror": False,                     # flip left/right turn hint if it feels reversed
     "tesseract_cmd": None,               # e.g. r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     # The pin is anchored to a corner, not placed at an absolute point, so the
@@ -1447,6 +1449,10 @@ class State:
         self.sys_log_time = 0.0  # when the system position was last logged
         self.sys_log_pos = None  # and what it was, to measure drift against
         self.sys_hits = 0        # how many frames have agreed with it
+        self.space_ref = None    # (sys_pos, time) the deep-space track is measured from
+        self.space_track = None  # unit vector of travel in the system frame
+        self.space_speed = None  # metres per second along it
+        self.space_track_time = 0.0
         self.spin_votes = []     # (body, time, star's longitude) not yet agreed
         self.system = None       # which star system the body is in
         self.location = None     # the game's own name for the place, if read
@@ -1539,6 +1545,40 @@ class State:
         self.sys_candidate = pos
         self.sys_hits = 1
         return self.sys_pos
+
+    def _track_space(self, now):
+        """Keep the deep-space track up to date. Call with the lock held.
+
+        The track is the direction the believed system position moves in,
+        measured over at least `space_min_move` so OCR jitter of a few metres
+        does not swing it. It is your direction of travel, not the way the ship
+        points, exactly like the planet heading: it only exists once you have
+        moved, and it goes stale after `space_track_age` seconds so a parked
+        ship does not keep pointing the way it last flew.
+
+        Losing the system lock (a quantum jump, the game stopping) drops the
+        track with it, as the next position has nothing in common with the
+        last. A relock looks like a jump of more than SYSTEM_LOCK_KM from the
+        reference, which starts the measurement over.
+        """
+        pos = self.sys_pos
+        if pos is None:
+            self.space_ref = None
+            self.space_track = None
+            return
+        if (self.space_ref is None
+                or math.dist(pos, self.space_ref[0]) > SYSTEM_LOCK_KM * 1000.0):
+            self.space_ref = (pos, now)
+            self.space_track = None
+            return
+        ref, t0 = self.space_ref
+        d = math.dist(pos, ref)
+        if d < self.cfg["space_min_move"] or now <= t0:
+            return
+        self.space_track = tuple((p - q) / d for p, q in zip(pos, ref))
+        self.space_speed = d / (now - t0)
+        self.space_track_time = now
+        self.space_ref = (pos, now)
 
     def system_still(self):
         """Is the system position steady enough to be worth marking?
@@ -1707,6 +1747,7 @@ class State:
                 self.location = None
                 self.sys_pos = self.sys_prev = self.sys_candidate = None
                 self.sys_hits = 0
+                self.space_ref = self.space_track = None
                 self.analysis = None
                 self.status = "game not running"
                 self.log("game not running - idling, no capture")
@@ -1723,6 +1764,7 @@ class State:
             # there is with no body in range, and it is what a waypoint out
             # there is measured against.
             self.sys_pos = self._settle_system_pos(sys_pos, now)
+            self._track_space(now)
             self._log_system_drift(now)
             # A place with no ground is sampled whether or not a body is in
             # range, and only on a reading this frame produced.
@@ -3416,14 +3458,36 @@ def render_target(state):
 
         if wp.get("frame") == "system":
             # Out between bodies there is no surface to measure over and no
-            # north to bear from, so the straight-line distance is all there
-            # is -- and all that is needed to fly back to it.
+            # north to bear from. What there is: the straight-line distance,
+            # and once you have moved, your track through the system frame,
+            # which the target direction can be measured against.
             lines.append(f"DEEP SPACE in {wp.get('system', 'unknown')}")
             if state.sys_pos is None:
                 lines.append("no system position yet")
+                return chr(10).join(lines)
+            gap = math.dist(state.sys_pos, (wp["x"], wp["y"], wp["z"]))
+            lines.append(f"DIST {fmt_dist(gap)} direct")
+            g = _space_guidance(state, wp, now)
+            if g is None:
+                lines.append("TRK  (move to get track)")
+                return chr(10).join(lines)
+            if g["off"] < 2:
+                trk = "TRK  on course"
             else:
-                gap = math.dist(state.sys_pos, (wp["x"], wp["y"], wp["z"]))
-                lines.append(f"DIST {fmt_dist(gap)} direct")
+                trk = f"TRK  off {g['off']:.0f}"
+                if abs(g["yaw"]) >= 1:
+                    trk += (f"  turn {'RIGHT' if g['yaw'] > 0 else 'LEFT'} "
+                            f"{abs(g['yaw']):.0f}")
+                if abs(g["pitch"]) >= 1:
+                    trk += (f"  pitch {'UP' if g['pitch'] > 0 else 'DOWN'} "
+                            f"{abs(g['pitch']):.0f}")
+            lines.append(trk)
+            spd = f"SPD  {g['speed']:,.0f} m/s"
+            if g["closing"] > 0:
+                spd += f"   closing   ETA {spin.fmt_duration(g['eta'])}"
+            elif g["closing"] < 0:
+                spd += "   OPENING - turn around"
+            lines.append(spd)
             return chr(10).join(lines)
 
         tlat, tlon, tr = to_latlon(wp["x"], wp["y"], wp["z"])
@@ -3465,24 +3529,93 @@ def render_target(state):
         return chr(10).join(lines)
 
 
-def target_turn(state, now=None):
-    """Degrees to turn for the target, + right and - left, or None.
+def _space_guidance(state, wp, now):
+    """How to steer for a deep-space target from the current track, or None.
 
-    None whenever the text block would say it cannot tell: no target, a
-    deep-space target, no fix on the target's body, or no recent heading.
+    Call with the lock held. The track is where the system position has been
+    moving, so this needs a believed position, a recent track and a target in
+    the system frame. Returns a dict:
+
+      off      degrees between the track and the target, 0 = dead on
+      yaw      degrees to turn, + right and - left
+      pitch    degrees to pitch, + up and - down
+      speed    metres per second along the track
+      closing  metres per second the gap shrinks by (negative = opening)
+      eta      seconds to arrive at the closing rate, or None
+
+    The system frame has no cockpit in it, so "right" and "up" need an
+    agreed horizon. Every body measured so far spins about the system z axis,
+    so z is taken as up and the xy plane as level, the way the star map and
+    most flying between bodies already treat it. Rolled well off level, left
+    and right swap with up and down; `mirror` covers a plain reversal.
+    """
+    if (state.sys_pos is None or state.space_track is None
+            or now - state.space_track_time >= state.cfg["space_track_age"]):
+        return None
+    fwd = state.space_track
+    to = [t - p for t, p in zip((wp["x"], wp["y"], wp["z"]), state.sys_pos)]
+    gap = math.sqrt(sum(c * c for c in to))
+    if gap <= 0:
+        return None
+    to = [c / gap for c in to]
+    # right = forward x up, up = right x forward, with system z as up. A track
+    # straight up or down has no "right"; fall back to the x axis for it.
+    rx, ry, rz = (fwd[1], -fwd[0], 0.0)
+    rn = math.hypot(rx, ry)
+    if rn < 1e-9:
+        rx, ry, rz, rn = 1.0, 0.0, 0.0, 1.0
+    right = (rx / rn, ry / rn, rz / rn)
+    up = (right[1] * fwd[2] - right[2] * fwd[1],
+          right[2] * fwd[0] - right[0] * fwd[2],
+          right[0] * fwd[1] - right[1] * fwd[0])
+    dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+    f, r, u = dot(to, fwd), dot(to, right), dot(to, up)
+    yaw = math.degrees(math.atan2(r, f))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, u))))
+    off = math.degrees(math.acos(max(-1.0, min(1.0, f))))
+    if state.cfg["mirror"]:
+        yaw = -yaw
+    closing = f * state.space_speed
+    eta = gap / closing if closing > 0 else None
+    return {"off": off, "yaw": yaw, "pitch": pitch, "speed": state.space_speed,
+            "closing": closing, "eta": eta, "gap": gap}
+
+
+def target_arrow(state, now=None):
+    """(turn, off, pitch) for the compass arrow, or None.
+
+    `turn` is degrees to turn, + right and - left; `off` is how far the track
+    is from the target in all, which sets the colour; `pitch` is + up and
+    - down, None for a target on a body where the arrow is flat.
+
+    None whenever the text block would say it cannot tell: no target, no fix
+    on the target's body, no recent heading, or no deep-space track.
     """
     now = time.time() if now is None else now
     with state.lock:
         wp = next((w for w in state.waypoints if w["name"] == state.target),
                   None)
-        if (wp is None or wp.get("frame") == "system" or state.pos is None
-                or wp.get("planet") != state.planet
+        if wp is None:
+            return None
+        if wp.get("frame") == "system":
+            g = _space_guidance(state, wp, now)
+            if g is None:
+                return None
+            return g["yaw"], g["off"], g["pitch"]
+        if (state.pos is None or wp.get("planet") != state.planet
                 or state.heading is None or now - state.heading_time >= 15):
             return None
         tlat, tlon, _ = to_latlon(wp["x"], wp["y"], wp["z"])
         lat, lon = state.latlon
         rel = (bearing(lat, lon, tlat, tlon) - state.heading + 540.0) % 360.0 - 180.0
-        return -rel if state.cfg["mirror"] else rel
+        rel = -rel if state.cfg["mirror"] else rel
+        return rel, abs(rel), None
+
+
+def target_turn(state, now=None):
+    """Degrees to turn for the target, + right and - left, or None."""
+    arrow = target_arrow(state, now)
+    return None if arrow is None else arrow[0]
 
 
 def arrow_polygon(rel, cx, cy, size):
@@ -3997,14 +4130,29 @@ def run_overlay(state, cfg):
                         highlightthickness=0)
     compass.pack(side="right", anchor="n")
 
-    def draw_compass(rel):
+    def draw_compass(arrow):
+        """`arrow` is target_arrow's (turn, off, pitch), or None.
+
+        The arrow turns by `turn` and is coloured by `off`. In deep space
+        `pitch` is drawn as a marker on the right edge: at the middle you are
+        level with the target, above it pitch up, below it pitch down.
+        """
         compass.delete("all")
-        c, r = ARROW_PX / 2, ARROW_PX / 2 - 4
-        colour = arrow_colour(rel)
+        c, r = ARROW_PX / 2, ARROW_PX / 2 - 6   # room for the pitch rail
+        turn, off, pitch = arrow if arrow is not None else (None, None, None)
+        colour = arrow_colour(off)
         compass.create_oval(c - r, c - r, c + r, c + r, outline="#243040")
         compass.create_line(c, c - r - 2, c, c - r + 5, fill=DIM)
-        compass.create_polygon(arrow_polygon(rel or 0.0, c, c, r - 4),
+        compass.create_polygon(arrow_polygon(turn or 0.0, c, c, r - 4),
                                fill=colour, outline="")
+        if pitch is not None:
+            # The rail at the right edge, then the marker on it.
+            x = ARROW_PX - 3
+            compass.create_line(x, c - r, x, c + r, fill="#243040")
+            compass.create_line(x - 2, c, x + 2, c, fill=DIM)
+            y = c - r * max(-1.0, min(1.0, pitch / 90.0))
+            compass.create_rectangle(x - 2, y - 2, x + 2, y + 2,
+                                     fill=colour, outline="")
 
     rule()
 
@@ -4538,7 +4686,7 @@ def run_overlay(state, cfg):
                 else:
                     target_block.pack_forget()
             target_lbl.config(text=render_target(state), fg=colour)
-            draw_compass(target_turn(state))
+            draw_compass(target_arrow(state))
             chosen = selected_name()
             with state.lock:
                 targeted = chosen is not None and chosen == state.target

@@ -204,12 +204,44 @@ coordinates, so you know which OM to jump to.
 Far from any body, the program switches to the **system-wide** position the
 HUD also prints, so you can mark a spot between planets (a parked ship, a
 wreck, a jump point). A deep-space waypoint has no latitude, longitude or
-bearing; the target block shows the straight-line distance (`DIST 61.91 Mm
-direct`). Distances use the game's units: m, km, Mm (megametres), Gm
-(gigametres).
+bearing; there is no north out there. Distances use the game's units: m, km,
+Mm (megametres), Gm (gigametres).
 
 To save one, hold still for a moment: out there nothing else can confirm the
 reading, so the position must be steady first.
+
+**Flying to one.** Target it and start moving. Once you have gone 200 m the
+program knows your track (the direction you are actually moving) and steers
+you from that:
+
+```
+TARGET wreck
+DEEP SPACE in stanton
+DIST 61.91 Mm direct
+TRK  off 23  turn RIGHT 20  pitch UP 11
+SPD  1,150 m/s   closing   ETA 14h 57m
+```
+
+| line  | meaning                                                                                                  |
+| ----- | -------------------------------------------------------------------------------------------------------- |
+| `TRK` | how far off the target your track is, split into a turn (left/right) and a pitch (up/down). `on course` under 2 degrees. `(move to get track)` until you have moved. |
+| `SPD` | your speed along the track, whether the gap is closing or opening, and the time to arrive at that rate. `OPENING` means you are flying away: turn around. |
+
+The compass arrow turns with the turn hint and is coloured by the total
+error (green under 10, amber under 45, red beyond). The marker on the rail
+at its right edge is the pitch: centre means level with the target, above
+means pitch up, below means pitch down.
+
+Two things to know. The track comes from how your position changes, so it is
+only right while you are flying straight; it goes stale after 30 seconds
+without 200 m of movement, so a parked ship shows `(move to get track)` again.
+And the system frame has no cockpit in it, so "up" is the system's own up
+(the axis the planets spin about). Fly roughly level with the planets' orbits
+and left/right/up/down mean what they say; rolled 90 degrees they swap. If
+left and right are simply reversed, set `"mirror": true`.
+
+Quantum travel freezes the HUD's system position for the whole jump, so the
+track is lost in a jump and comes back a few seconds after you drop out.
 
 ### Body analysis: spin, sun, sunset
 
@@ -528,6 +560,8 @@ program is closed. The ones you are most likely to change:
 | `survey_max_height_m` | `5000` | height (m) over the reference sphere above which survey records nothing |
 | `water_below_cam_m` | `2` | how far (m) below your camera the water is when a lake survey starts |
 | `min_move` | `20.0` | metres you must move before your heading updates |
+| `space_min_move` | `200.0` | metres you must move in deep space before your track updates |
+| `space_track_age` | `30.0` | seconds without that movement before the deep-space track is dropped |
 | `game_process` | `["starcitizen.exe"]` | process names that count as the game running |
 | `tesseract_cmd` | `null` | path to your own `tesseract.exe`, to use instead of the packed one |
 
@@ -611,6 +645,10 @@ command prompt, reproduce it, and attach `session.log`.
 - The built-in radius table covers **Stanton, Pyro and Nyx I**. Other Nyx
   bodies use the radius the HUD prints, which OCR reads less reliably.
 - Distance and bearing to a waypoint only work while you are on the same body.
+- In deep space the turn and pitch hints assume you fly roughly level with the
+  system (planets' orbital plane) as up. Rolled well off that, left/right and
+  up/down swap. The total `off` angle and the closing/opening test are right
+  whatever your roll.
 - The analysis assumes every body spins the same way as the ones measured so
   far. The report's `Check` line warns if a result disagrees.
 - On foot in very dark places the fix can drop out. Not yet tested properly.
