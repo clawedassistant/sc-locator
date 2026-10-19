@@ -2526,7 +2526,7 @@ def auto_name(wps, planet):
 
 
 def add_waypoint(wps, planet, pos, radius, name=None, elev=None, agl=None,
-                 system=None, frame="planet", wtype="poi"):
+                 system=None, frame="planet", wtype="poi", sys_pos=None):
     """Append a waypoint in place and return its name. None auto-names it.
 
     `elev` is the terrain's height over the reference sphere at this spot and
@@ -2560,6 +2560,14 @@ def add_waypoint(wps, planet, pos, radius, name=None, elev=None, agl=None,
     if elev is not None:
         entry["elev"] = elev
         entry["agl"] = agl
+    # The same spot in the system frame, for a thing that may not turn with
+    # the body: a ship left in space 320 km above Yela was nowhere near its
+    # body-frame waypoint twenty hours later (2026-10-19), and whether the
+    # game keeps such a ship in the body's turning frame or holds it still
+    # in the system is not known. With both saved, the target block can
+    # show the trip to each.
+    if sys_pos is not None:
+        entry["sx"], entry["sy"], entry["sz"] = sys_pos
     wps.append(entry)
     return name
 
@@ -2670,7 +2678,7 @@ def export_json(path, data):
 IMPORT_NEAR_M = 1000.0   # an imported waypoint this close to one of ours asks
 # What an imported waypoint may carry; anything else in the file is dropped.
 IMPORT_FIELDS = ("name", "planet", "system", "frame", "type", "x", "y", "z",
-                 "radius", "elev", "agl", "parent", "note")
+                 "radius", "elev", "agl", "parent", "note", "sx", "sy", "sz")
 
 
 def _is_number(v):
@@ -3109,7 +3117,11 @@ def save_waypoint(state, name=None):
         try:
             name = add_waypoint(state.waypoints, state.planet, state.pos,
                                 state.radius, name, state.elev, state.agl,
-                                state.system)
+                                state.system,
+                                sys_pos=state.sys_pos
+                                if state.sys_pos is not None
+                                and time.time() - state.sys_pos_time < 5.0
+                                else None)
         except ValueError as exc:
             state.flash(str(exc))
             state.log(f"save refused: {exc}")
@@ -3892,6 +3904,24 @@ def render_target(state):
         lines.append(line)
         lines.append(_steer_line("NOSE", nose, "(no CamDir on HUD)"))
         lines.append(f"ALT  {fmt_dist(tr - r)} vs you")
+        # The other reading of the same save: where it is if it held still
+        # in the system frame instead of turning with the body. Measured in
+        # that frame, so no lock is needed and the camera is used as is.
+        if "sx" in wp and state.sys_pos is not None:
+            here, _ = _predicted_sys_pos(state, now)
+            still = (wp["sx"], wp["sy"], wp["sz"])
+            line = f"STILL {fmt_dist(math.dist(here, still))} if it did not turn with {state.planet}"
+            if state.cam_dir is not None and now - state.cam_dir_time < 5.0:
+                to, gap = _unit_to(here, still)
+                if to is not None:
+                    off, yaw, pitch = _steer(state.cam_dir, to,
+                                             state.cam_up or (0.0, 0.0, 1.0),
+                                             (state.cfg["mirror"], state.cfg["mirror_pitch"]))
+                    line = (f"STILL {fmt_dist(gap)}  off {off:.0f}"
+                            + (f"  turn {'RIGHT' if yaw > 0 else 'LEFT'} {abs(yaw):.0f}" if abs(yaw) >= 1 else "")
+                            + (f"  pitch {'UP' if pitch > 0 else 'DOWN'} {abs(pitch):.0f}" if abs(pitch) >= 1 else "")
+                            + "  (if it did not turn)")
+            lines.append(line)
         return chr(10).join(lines)
 
 
@@ -4224,7 +4254,7 @@ LOCATION_ROWS = 6
 SURVEY_ROWS = 5
 DIRECTIONS = "#FFFFFF"  # the survey's what-to-fly lines: apart from all else
 TURN_COLOUR = "#FFE45C"  # and as a corner comes up: catches the eye
-TARGET_ROWS = 6
+TARGET_ROWS = 7
 REPORT_ROWS = 14        # the body analysis, in its block under the status
 NO_LABEL = "(not labelled)"
 NO_STATION = "(no station)"

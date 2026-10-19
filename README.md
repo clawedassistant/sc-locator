@@ -243,6 +243,21 @@ is the total error: green under 10, amber under 45, red beyond. It follows
 `NOSE` also appears for a target on a body, next to `BRG`/`HDG`, with up
 meaning straight up from the ground.
 
+**A ship you left in space.** A waypoint near a moon is saved in the moon's
+turning frame, which is right for anything that turns with the moon. A ship
+parked in space may instead hold still while the moon turns under it; the
+app does not know which the game does. So every save near a body now also
+keeps the spot in the system frame, and the target block shows a second
+line for it:
+
+```
+STILL 8.91 km  off 23  turn LEFT 20  pitch UP 4  (if it did not turn)
+```
+
+`DIST` and `NOSE` are the trip if the thing turned with the moon; `STILL`
+is the trip if it held still in space. Fly to one, then the other. Saves
+made before this version have no `STILL` line.
+
 Two things to know. The system frame has no cockpit in it, so "up" out there
 is the system's own up (the axis the planets spin about). Fly roughly level
 with the planets' orbits and left/right/up/down mean what they say; rolled 90
